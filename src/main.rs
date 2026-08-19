@@ -79,34 +79,8 @@ where
     values
 }
 
-/// Read the first per-chromosome painting file, setting entries to value * weight.
-/// (Equivalent to C++ readdatafirst: uses set, not accumulate.)
-fn read_data_first(filename: &str, cl: &mut HMat, weight: f64) {
-    let file =
-        File::open(filename).unwrap_or_else(|e| panic!("could not open {}: {}", filename, e));
-    let reader = BufReader::new(GzDecoder::new(file));
-
-    let mut q = 1usize;
-    for line in reader.lines() {
-        let line = line.unwrap();
-        let mut parts = line.split_ascii_whitespace();
-        let ind1: usize = parts.next().unwrap().parse().unwrap();
-        let ind2: usize = parts.next().unwrap().parse().unwrap();
-        let value: f64 = parts.next().unwrap().parse().unwrap();
-
-        if ind1 == q {
-            if q % 1000 == 0 {
-                println!("ind{}", q);
-            }
-            q += 1;
-        }
-
-        cl.m[ind1 - 1].set(ind2 - 1, value * weight);
-    }
-}
-
-/// Read a subsequent per-chromosome painting file, accumulating value * weight
-/// into existing entries.
+/// Read a per-chromosome painting file, accumulating value * weight
+/// into existing entries or creating new ones.
 /// (Equivalent to C++ readdata: reads existing value and adds.)
 fn read_data(filename: &str, cl: &mut HMat, weight: f64) {
     let file =
@@ -163,8 +137,7 @@ fn run<W: Write>(
 
     // Accumulate weighted chunk lengths across all chromosomes.
     let mut cl = HMat::new(nind, 0.0);
-    read_data_first(&chr_filenames[0], &mut cl, weights[0]);
-    for i in 1..chr_filenames.len() {
+    for i in 0..chr_filenames.len() {
         println!("Processing chromosome {}", i + 1);
         read_data(&chr_filenames[i], &mut cl, weights[i]);
     }
