@@ -61,10 +61,8 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Debug,
 {
-    let file = File::open(filename).unwrap_or_else(|e| {
-        eprintln!("Error: could not open file {}: {}", filename, e);
-        std::process::exit(1);
-    });
+    let file =
+        File::open(filename).unwrap_or_else(|e| panic!("could not open file {}: {}", filename, e));
     let reader = BufReader::new(file);
     let mut values = Vec::new();
     for line in reader.lines() {
@@ -73,13 +71,9 @@ where
         if trimmed.is_empty() {
             continue;
         }
-        let value: T = trimmed.parse().unwrap_or_else(|e| {
-            eprintln!(
-                "Error: could not parse '{}' from {}: {:?}",
-                trimmed, filename, e
-            );
-            std::process::exit(1);
-        });
+        let value: T = trimmed
+            .parse()
+            .unwrap_or_else(|e| panic!("could not parse '{}' from {}: {:?}", trimmed, filename, e));
         values.push(value);
     }
     values
@@ -88,10 +82,8 @@ where
 /// Read the first per-chromosome painting file, setting entries to value * weight.
 /// (Equivalent to C++ readdatafirst: uses set, not accumulate.)
 fn read_data_first(filename: &str, cl: &mut HMat, weight: f64) {
-    let file = File::open(filename).unwrap_or_else(|e| {
-        eprintln!("Error: could not open {}: {}", filename, e);
-        std::process::exit(1);
-    });
+    let file =
+        File::open(filename).unwrap_or_else(|e| panic!("could not open {}: {}", filename, e));
     let reader = BufReader::new(GzDecoder::new(file));
 
     let mut q = 1usize;
@@ -117,10 +109,8 @@ fn read_data_first(filename: &str, cl: &mut HMat, weight: f64) {
 /// into existing entries.
 /// (Equivalent to C++ readdata: reads existing value and adds.)
 fn read_data(filename: &str, cl: &mut HMat, weight: f64) {
-    let file = File::open(filename).unwrap_or_else(|e| {
-        eprintln!("Error: could not open {}: {}", filename, e);
-        std::process::exit(1);
-    });
+    let file =
+        File::open(filename).unwrap_or_else(|e| panic!("could not open {}: {}", filename, e));
     let reader = BufReader::new(GzDecoder::new(file));
 
     let mut q = 1usize;
@@ -143,54 +133,27 @@ fn read_data(filename: &str, cl: &mut HMat, weight: f64) {
 }
 
 // ---------------------------------------------------------------------------
-// main
+// Core logic
 // ---------------------------------------------------------------------------
 
 /// Maximum number of entries permitted in the output matrix (2^31 - 1).
 /// This is a downstream constraint: indices must fit in a signed 32-bit integer.
 const MAX_ENTRIES: usize = (1usize << 31) - 1;
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!(
-            "Usage: {} <chr_chunks_filenames_list> <chr_snp_counts_list> <chr_map_lengths_list> <nind> <outfile>",
-            args[0]
-        );
-        println!("  Row sums (pre-dynamic-exclusion) are written to <outfile>.rowsums");
-        return;
-    }
-
-    if args.len() != 6 {
-        eprintln!(
-            "Usage: {} <chr_chunks_filenames_list> <chr_snp_counts_list> <chr_map_lengths_list> <nind> <outfile>",
-            args[0]
-        );
-        std::process::exit(1);
-    }
-
-    let filenames_list = &args[1];
-    let snp_counts_list = &args[2];
-    let map_lengths_list = &args[3];
-    let nind: usize = args[4].parse().unwrap_or_else(|_| {
-        eprintln!("Error: <nind> must be a positive integer");
-        std::process::exit(1);
-    });
-    let outfile = &args[5];
-
-    let chr_filenames = read_values_per_line::<String>(filenames_list);
-    let total_snp = read_values_per_line::<f64>(snp_counts_list);
-    let total_gd = read_values_per_line::<f64>(map_lengths_list);
-
-    if chr_filenames.len() != total_snp.len() || chr_filenames.len() != total_gd.len() {
-        eprintln!(
-            "Error: {}, {} and {} must all have the same number of lines (one per chromosome)",
-            filenames_list, snp_counts_list, map_lengths_list
-        );
-        std::process::exit(1);
-    }
-
+/// Accumulate per-chromosome chunk-length painting files into a single
+/// genome-wide weighted matrix and write the result to `out` (gzipped).
+///
+/// Per-row sums (computed before any dynamic exclusion) are written to
+/// `rowsums_out` so downstream consumers can use the correct normalisation
+/// denominator even when the dynamic threshold is active.
+fn run<W: Write>(
+    chr_filenames: &[String],
+    total_snp: &[f64],
+    total_gd: &[f64],
+    nind: usize,
+    out: W,
+    rowsums_out: W,
+) {
     // Per-chromosome weight: genetic map length / SNP count, rounded to 6 d.p.
     let weights: Vec<f64> = total_gd
         .iter()
@@ -240,8 +203,8 @@ fn main() {
     // -----------------------------------------------------------------------
     let dynamic_threshold: f64 = if all_values.len() >= (1usize << 31) {
         let n_to_drop = all_values.len() - MAX_ENTRIES;
-        // select_nth_unstable(k) rearranges all_values so that the element at
-        // sorted position k is in place. Elements before it are <= it and
+        // select_nth_unstable_by(k) rearranges all_values so that the element
+        // at sorted position k is in place. Elements before it are <= it and
         // elements after are >= it. We then keep entries strictly > threshold,
         // guaranteeing at most MAX_ENTRIES entries in the output.
         // f64 doesn't implement Ord (due to NaN), so we use partial_cmp.
@@ -267,13 +230,9 @@ fn main() {
     // Pass 2: write the output matrix, applying both thresholds.
     //
     // An entry is written iff:
-    //   val >= 0.000005   (static threshold, always applied)
-    //   val > dynamic_threshold  (dynamic threshold, only active when >= 2^31 entries)
+    //   val >= 0.000005          (static threshold, always applied)
+    //   val > dynamic_threshold  (only active when total entries >= 2^31)
     // -----------------------------------------------------------------------
-    let out = File::create(outfile).unwrap_or_else(|e| {
-        eprintln!("Error: could not create output file {}: {}", outfile, e);
-        std::process::exit(1);
-    });
     let mut writer = BufWriter::new(GzEncoder::new(out, Compression::default()));
 
     for i in 0..nind {
@@ -285,7 +244,7 @@ fn main() {
     }
 
     // -----------------------------------------------------------------------
-    // Write row sums file.
+    // Write row sums.
     //
     // Contains one value per line (individual 1 on line 1, etc.) representing
     // the sum of all entries in that row that survived the static threshold,
@@ -293,16 +252,133 @@ fn main() {
     // normalisation denominator rather than recomputing from the (possibly
     // truncated) output matrix.
     // -----------------------------------------------------------------------
-    let rowsums_path = format!("{}.rowsums", outfile);
-    let rowsums_file = File::create(&rowsums_path).unwrap_or_else(|e| {
-        eprintln!(
-            "Error: could not create row sums file {}: {}",
-            rowsums_path, e
-        );
-        std::process::exit(1);
-    });
-    let mut rowsums_writer = BufWriter::new(rowsums_file);
+    let mut rowsums_writer = BufWriter::new(rowsums_out);
     for &rs in &row_sums {
         writeln!(rowsums_writer, "{:.5}", rs).unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!(
+            "Usage: {} <chr_chunks_filenames_list> <chr_snp_counts_list> <chr_map_lengths_list> <nind> <outfile>",
+            args[0]
+        );
+        println!("  Row sums (pre-dynamic-exclusion) are written to <outfile>.rowsums");
+        return;
+    }
+
+    if args.len() != 6 {
+        eprintln!(
+            "Usage: {} <chr_chunks_filenames_list> <chr_snp_counts_list> <chr_map_lengths_list> <nind> <outfile>",
+            args[0]
+        );
+        std::process::exit(1);
+    }
+
+    let filenames_list = &args[1];
+    let snp_counts_list = &args[2];
+    let map_lengths_list = &args[3];
+    let nind: usize = args[4].parse().unwrap_or_else(|_| {
+        eprintln!("Error: <nind> must be a positive integer");
+        std::process::exit(1);
+    });
+    let outfile = &args[5];
+
+    let chr_filenames = read_values_per_line::<String>(filenames_list);
+    let total_snp = read_values_per_line::<f64>(snp_counts_list);
+    let total_gd = read_values_per_line::<f64>(map_lengths_list);
+
+    if chr_filenames.len() != total_snp.len() || chr_filenames.len() != total_gd.len() {
+        eprintln!(
+            "Error: {}, {} and {} must all have the same number of lines (one per chromosome)",
+            filenames_list, snp_counts_list, map_lengths_list
+        );
+        std::process::exit(1);
+    }
+
+    let out = File::create(outfile).unwrap_or_else(|e| {
+        eprintln!("Error: could not create {}: {}", outfile, e);
+        std::process::exit(1)
+    });
+
+    let rowsums_path = format!("{}.rowsums", outfile);
+    let rowsums_out = File::create(&rowsums_path).unwrap_or_else(|e| {
+        eprintln!("Error: could not create {}: {}", rowsums_path, e);
+        std::process::exit(1)
+    });
+
+    run(
+        &chr_filenames,
+        &total_snp,
+        &total_gd,
+        nind,
+        out,
+        rowsums_out,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufReader;
+    use std::path::PathBuf;
+
+    fn testdata(filename: &str) -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(filename)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Decompress a gzipped byte slice and return its lines sorted.
+    /// Sorting is necessary because HashMap iteration order is non-deterministic.
+    fn decode_gz_sorted(bytes: &[u8]) -> Vec<String> {
+        let reader = BufReader::new(GzDecoder::new(bytes));
+        let mut lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+        lines.sort();
+        lines
+    }
+
+    #[test]
+    fn test_combine_matches_expected() {
+        let chr_filenames = vec![
+            testdata("chr01.chunklengths.s.out.gz"),
+            testdata("chr02.chunklengths.s.out.gz"),
+            testdata("chr03.chunklengths.s.out.gz"),
+            testdata("chr04.chunklengths.s.out.gz"),
+            testdata("chr05.chunklengths.s.out.gz"),
+        ];
+        let total_snp = vec![12328.0, 11992.0, 10200.0, 9588.0, 9272.0];
+        let total_gd = vec![286.28, 268.83, 223.26, 214.54, 204.09];
+        let nind = 10;
+
+        let mut out_buf: Vec<u8> = Vec::new();
+        let mut rowsums_buf: Vec<u8> = Vec::new();
+        run(
+            &chr_filenames,
+            &total_snp,
+            &total_gd,
+            nind,
+            &mut out_buf,
+            &mut rowsums_buf,
+        );
+
+        let actual = decode_gz_sorted(&out_buf);
+        let expected =
+            decode_gz_sorted(&std::fs::read(testdata("combined.chunklengths.txt.gz")).unwrap());
+
+        assert_eq!(actual, expected);
     }
 }
