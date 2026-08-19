@@ -15,28 +15,16 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 
 struct HVec {
     v: HashMap<usize, f64>,
-    x0: f64, // default value for missing entries
 }
 
 impl HVec {
-    fn new(x0: f64) -> Self {
-        HVec {
-            v: HashMap::new(),
-            x0,
-        }
-    }
-
-    fn get(&self, p: usize) -> f64 {
-        *self.v.get(&p).unwrap_or(&self.x0)
-    }
-
-    fn set(&mut self, p: usize, val: f64) {
-        self.v.insert(p, val);
+    fn new() -> Self {
+        HVec { v: HashMap::new() }
     }
 
     fn add(&mut self, p: usize, delta: f64) {
-        let current = self.get(p);
-        self.v.insert(p, current + delta);
+        let current = self.v.entry(p).or_insert(0.0);
+        *current += delta;
     }
 }
 
@@ -45,8 +33,8 @@ struct HMat {
 }
 
 impl HMat {
-    fn new(nrows: usize, x0: f64) -> Self {
-        let m = (0..nrows).map(|_| HVec::new(x0)).collect();
+    fn new(nrows: usize) -> Self {
+        let m = (0..nrows).map(|_| HVec::new()).collect();
         HMat { m }
     }
 }
@@ -136,7 +124,7 @@ fn run<W: Write>(
         .collect();
 
     // Accumulate weighted chunk lengths across all chromosomes.
-    let mut cl = HMat::new(nind, 0.0);
+    let mut cl = HMat::new(nind);
     for i in 0..chr_filenames.len() {
         println!("Processing chromosome {}", i + 1);
         read_data(&chr_filenames[i], &mut cl, weights[i]);
