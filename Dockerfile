@@ -14,6 +14,7 @@ WORKDIR /combine
 
 RUN source $HOME/.cargo/env && \
     cargo build --release && \
-    cp target/release/combine /usr/local/bin/combine
+    mv target/release/combine /usr/local/bin/combine && \
+    rm -rf /combine
 
 CMD ["combine", "-h"]
