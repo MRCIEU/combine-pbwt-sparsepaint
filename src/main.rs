@@ -29,13 +29,16 @@ impl HVec {
 }
 
 struct HMat {
-    m: Vec<HVec>,
+    m: HashMap<usize, HVec>,
 }
 
 impl HMat {
-    fn new(nrows: usize) -> Self {
-        let m = (0..nrows).map(|_| HVec::new()).collect();
-        HMat { m }
+    fn new() -> Self {
+        HMat { m: HashMap::new() }
+    }
+
+    fn get(&mut self, row: usize) -> &mut HVec {
+        self.m.entry(row).or_insert_with(|| HVec::new())
     }
 }
 
@@ -75,7 +78,7 @@ fn read_data(filename: &str, cl: &mut HMat, weight: f64) {
         File::open(filename).unwrap_or_else(|e| panic!("could not open {}: {}", filename, e));
     let reader = BufReader::new(GzDecoder::new(file));
 
-    let mut q = 1usize;
+    // let mut q = 1usize;
     for line in reader.lines() {
         let line = line.unwrap();
         let mut parts = line.split_ascii_whitespace();
@@ -83,14 +86,14 @@ fn read_data(filename: &str, cl: &mut HMat, weight: f64) {
         let ind2: usize = parts.next().unwrap().parse().unwrap();
         let value: f64 = parts.next().unwrap().parse().unwrap();
 
-        if ind1 == q {
-            if q % 1000 == 0 {
-                println!("ind{}", q);
-            }
-            q += 1;
-        }
+        // if ind1 == q {
+        //     if q % 1000 == 0 {
+        //         println!("ind{}", q);
+        //     }
+        //     q += 1;
+        // }
 
-        cl.m[ind1 - 1].add(ind2 - 1, value * weight);
+        cl.get(ind1 - 1).add(ind2 - 1, value * weight);
     }
 }
 
@@ -124,7 +127,7 @@ fn run<W: Write>(
         .collect();
 
     // Accumulate weighted chunk lengths across all chromosomes.
-    let mut cl = HMat::new(nind);
+    let mut cl = HMat::new();
     for i in 0..chr_filenames.len() {
         println!("Processing chromosome {}", i + 1);
         read_data(&chr_filenames[i], &mut cl, weights[i]);
@@ -143,7 +146,7 @@ fn run<W: Write>(
     let mut row_sums: Vec<f64> = vec![0.0; nind];
 
     for i in 0..nind {
-        for (&_j, &val) in &cl.m[i].v {
+        for (&_j, &val) in &cl.get(i).v {
             if val >= 0.000005 {
                 row_sums[i] += val;
                 all_values.push(val);
@@ -196,8 +199,19 @@ fn run<W: Write>(
     // -----------------------------------------------------------------------
     let mut writer = BufWriter::new(GzEncoder::new(out, Compression::default()));
 
-    for i in 0..nind {
-        for (&j, &val) in &cl.m[i].v {
+    // for i in 0..nind {
+    //     // TODO: sort by indices to print in order?
+    //     for (&j, &val) in &cl.get(i).v {
+    //         if val >= 0.000005 && val > dynamic_threshold {
+    //             writeln!(writer, "{} {} {:.5}", i + 1, j + 1, val).unwrap();
+    //         }
+    //     }
+    // }
+
+    let sorted_rows: std::collections::BTreeMap<_, _> = cl.m.iter().collect();
+    for (&i, row) in sorted_rows {
+        let sorted_cols: std::collections::BTreeMap<_, _> = row.v.iter().collect();
+        for (&j, &val) in sorted_cols {
             if val >= 0.000005 && val > dynamic_threshold {
                 writeln!(writer, "{} {} {:.5}", i + 1, j + 1, val).unwrap();
             }
@@ -298,6 +312,7 @@ mod tests {
     fn testdata(filename: &str) -> String {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
+            .join("n10000")
             .join(filename)
             .to_string_lossy()
             .into_owned()
@@ -305,11 +320,21 @@ mod tests {
 
     /// Decompress a gzipped byte slice and return its lines sorted.
     /// Sorting is necessary because HashMap iteration order is non-deterministic.
-    fn decode_gz_sorted(bytes: &[u8]) -> Vec<String> {
+    fn decode_gz(bytes: &[u8]) -> Vec<String> {
         let reader = BufReader::new(GzDecoder::new(bytes));
-        let mut lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
-        lines.sort();
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
         lines
+    }
+
+    fn load_f64_vec(filename: &str) -> Vec<f64> {
+        let mut vec: Vec<f64> = Vec::new();
+        let mut file = std::fs::File::open(filename).unwrap();
+        let reader = std::io::BufReader::new(&mut file);
+        for line in reader.lines() {
+            let line = line.unwrap();
+            vec.push(line.parse().unwrap());
+        }
+        vec
     }
 
     #[test]
@@ -321,9 +346,9 @@ mod tests {
             testdata("chr04.chunklengths.s.out.gz"),
             testdata("chr05.chunklengths.s.out.gz"),
         ];
-        let total_snp = vec![12328.0, 11992.0, 10200.0, 9588.0, 9272.0];
-        let total_gd = vec![286.28, 268.83, 223.26, 214.54, 204.09];
-        let nind = 10;
+        let total_snp = load_f64_vec(&testdata("nsnps.txt"));
+        let total_gd = load_f64_vec(&testdata("chr1-5.maplengths.txt"));
+        let nind = 10000;
 
         let mut out_buf: Vec<u8> = Vec::new();
         let mut rowsums_buf: Vec<u8> = Vec::new();
@@ -336,9 +361,8 @@ mod tests {
             &mut rowsums_buf,
         );
 
-        let actual = decode_gz_sorted(&out_buf);
-        let expected =
-            decode_gz_sorted(&std::fs::read(testdata("combined.chunklengths.txt.gz")).unwrap());
+        let actual = decode_gz(&out_buf);
+        let expected = decode_gz(&std::fs::read(testdata("combined.chunklengths.txt.gz")).unwrap());
 
         assert_eq!(actual, expected);
     }
