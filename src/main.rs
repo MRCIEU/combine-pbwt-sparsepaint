@@ -1,7 +1,7 @@
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -14,12 +14,12 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 // ---------------------------------------------------------------------------
 
 struct HVec {
-    v: HashMap<usize, f64>,
+    v: BTreeMap<usize, f64>,
 }
 
 impl HVec {
     fn new() -> Self {
-        HVec { v: HashMap::new() }
+        HVec { v: BTreeMap::new() }
     }
 
     fn add(&mut self, p: usize, delta: f64) {
@@ -29,12 +29,12 @@ impl HVec {
 }
 
 struct HMat {
-    m: HashMap<usize, HVec>,
+    m: BTreeMap<usize, HVec>,
 }
 
 impl HMat {
     fn new() -> Self {
-        HMat { m: HashMap::new() }
+        HMat { m: BTreeMap::new() }
     }
 
     fn get(&mut self, row: usize) -> &mut HVec {
@@ -208,10 +208,8 @@ fn run<W: Write>(
     //     }
     // }
 
-    let sorted_rows: std::collections::BTreeMap<_, _> = cl.m.iter().collect();
-    for (&i, row) in sorted_rows {
-        let sorted_cols: std::collections::BTreeMap<_, _> = row.v.iter().collect();
-        for (&j, &val) in sorted_cols {
+    for (i, row) in cl.m {
+        for (j, val) in row.v {
             if val >= 0.000005 && val > dynamic_threshold {
                 writeln!(writer, "{} {} {:.5}", i + 1, j + 1, val).unwrap();
             }
