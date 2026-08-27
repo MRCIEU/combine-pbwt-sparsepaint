@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crossbeam-channel = "0.5.16"
+crossbeam-utils = "0.8.22"
 flate2 = "1"
+gzp = "2.0.4"
