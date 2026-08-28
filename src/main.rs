@@ -1,21 +1,75 @@
-use flate2::Compression;
+use clap::Parser;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use gzp::{ZBuilder, ZWriter, deflate::Gzip};
 use std::collections::BTreeMap;
-use std::env;
 use std::fs::File;
+use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use thiserror::Error;
 
 mod write;
 use write::parallel_read_write;
 
+type Result<T> = std::result::Result<T, CombineError>;
+
+#[derive(Debug, Error)]
+enum CombineError {
+    #[error(transparent)]
+    IOError(#[from] io::Error),
+    #[error(transparent)]
+    ParseIntError(#[from] std::num::ParseIntError),
+    #[error(transparent)]
+    ParseFloatError(#[from] std::num::ParseFloatError),
+    #[error(transparent)]
+    ChanSendRowLocationErr(#[from] crossbeam_channel::SendError<write::RowLocation>),
+    #[error(transparent)]
+    ChanSendWriteDataErr(#[from] crossbeam_channel::SendError<write::WriteData>),
+    #[error("lock poisoned")]
+    LockPoisoned,
+    #[error(transparent)]
+    GZipError(#[from] gzp::GzpError),
+    #[error("thread panicked: {0}")]
+    ThreadPanic(String),
+    #[error("{0}")]
+    Message(String),
+}
+
+impl<T> From<std::sync::PoisonError<T>> for CombineError {
+    fn from(_: std::sync::PoisonError<T>) -> Self {
+        CombineError::LockPoisoned
+    }
+}
+
+impl From<Box<dyn std::any::Any + Send + 'static>> for CombineError {
+    fn from(e: Box<dyn std::any::Any + Send + 'static>) -> Self {
+        let msg = e
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        CombineError::ThreadPanic(msg)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sparse matrix
 //
-// HVec is a sparse vector: only non-default entries are stored in a (BTree)Map.
 // HMat is a sparse matrix: a (BTree)Map of HVec rows.
+// HVec is a sparse vector: only non-default entries are stored in a (BTree)Map.
 // ---------------------------------------------------------------------------
+
+struct HMat {
+    m: BTreeMap<usize, HVec>,
+}
+
+impl HMat {
+    fn new() -> Self {
+        HMat { m: BTreeMap::new() }
+    }
+
+    fn get(&mut self, row: usize) -> &mut HVec {
+        self.m.entry(row).or_insert_with(HVec::new)
+    }
+}
 
 struct HVec {
     v: BTreeMap<usize, f64>,
@@ -32,97 +86,79 @@ impl HVec {
     }
 }
 
-struct HMat {
-    m: BTreeMap<usize, HVec>,
-}
-
-impl HMat {
-    fn new() -> Self {
-        HMat { m: BTreeMap::new() }
-    }
-
-    fn get(&mut self, row: usize) -> &mut HVec {
-        self.m.entry(row).or_insert_with(|| HVec::new())
-    }
-}
-
 // ---------------------------------------------------------------------------
-// I/O helpers
+// CLI entry point
 // ---------------------------------------------------------------------------
 
-/// Read one whitespace-trimmed token per non-blank line into a Vec<T>.
-fn read_values_per_line<T>(filename: &str) -> Vec<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Debug,
-{
-    let file =
-        File::open(filename).unwrap_or_else(|e| panic!("could not open file {}: {}", filename, e));
-    let reader = BufReader::new(file);
-    let mut values = Vec::new();
-    for line in reader.lines() {
-        let line = line.unwrap();
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: T = trimmed
-            .parse()
-            .unwrap_or_else(|e| panic!("could not parse '{}' from {}: {:?}", trimmed, filename, e));
-        values.push(value);
-    }
-    values
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Args {
+    /// A file containing the paths to the chunk files.
+    #[arg(short, long, required = true)]
+    chunkpathsfile: String,
+
+    /// A file containing the SNP counts for each chunk, in the same order as the chunk paths file.
+    #[arg(short, long, required = true)]
+    snpcountsfile: String,
+
+    /// A file containing the map lengths for each chunk, in the same order as the chunk paths file.
+    #[arg(short, long, required = true)]
+    maplengthsfile: String,
+
+    /// The total number of samples.
+    #[arg(short, long, required = true)]
+    nsample: usize,
+
+    /// The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
+    #[arg(short, long, default_missing_value = "2147483648", num_args = 0..=1, require_equals = true)]
+    restrictrows: Option<usize>,
+
+    /// Write the row sums. If --restrictrows is in effect, this file will be written anyway.
+    #[arg(short, long, required = false, default_value_t = false)]
+    writerowsums: bool,
+
+    /// The number of threads to use for writing.
+    #[arg(short, long, required = false, default_value_t = 8)]
+    threads: usize,
+
+    /// The prefix for the output file(s).
+    #[arg(short, long, required = false, default_value = "combined")]
+    out: String,
 }
 
-/// Read a per-chromosome painting file, accumulating value * weight
-/// into existing entries or creating new ones.
-/// (Equivalent to C++ readdata: reads existing value and adds.)
-fn read_data(filename: &str, cl: &mut HMat, weight: f64) {
-    let file =
-        File::open(filename).unwrap_or_else(|e| panic!("could not open {}: {}", filename, e));
-    let reader = BufReader::new(GzDecoder::new(file));
+fn main() {
+    let args = Args::parse();
 
-    // let mut q = 1usize;
-    for line in reader.lines() {
-        let line = line.unwrap();
-        let mut parts = line.split_ascii_whitespace();
-        let ind1: usize = parts.next().unwrap().parse().unwrap();
-        let ind2: usize = parts.next().unwrap().parse().unwrap();
-        let value: f64 = parts.next().unwrap().parse().unwrap();
-
-        // if ind1 == q {
-        //     if q % 1000 == 0 {
-        //         println!("ind{}", q);
-        //     }
-        //     q += 1;
-        // }
-
-        cl.get(ind1 - 1).add(ind2 - 1, value * weight);
-    }
+    run(args).unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    });
 }
 
-// ---------------------------------------------------------------------------
-// Core logic
-// ---------------------------------------------------------------------------
+fn run(mut args: Args) -> Result<()> {
+    if args.threads < 1 {
+        return Err(CombineError::Message(
+            "invalid value for --threads <THREADS>: must be at least 1".to_string(),
+        ));
+    }
 
-/// Maximum number of entries permitted in the output matrix (2^31 - 1).
-/// This is a downstream constraint: indices must fit in a signed 32-bit integer.
-const MAX_ENTRIES: usize = (1usize << 31) - 1;
+    let nrows = args.restrictrows;
 
-/// Accumulate per-chromosome chunk-length painting files into a single
-/// genome-wide weighted matrix and write the result to `out` (gzipped).
-///
-/// Per-row sums (computed before any dynamic exclusion) are written to
-/// `rowsums_out` so downstream consumers can use the correct normalisation
-/// denominator even when the dynamic threshold is active.
-fn run<WS: Write + Send + 'static, W: Write>(
-    chr_filenames: &[String],
-    total_snp: &[f64],
-    total_gd: &[f64],
-    nind: usize,
-    out: WS,
-    rowsums_out: W,
-) {
+    if nrows.is_some() {
+        args.writerowsums = true;
+    }
+
+    let chr_filenames = read_values_per_line::<String>(&args.chunkpathsfile)?;
+    let total_snp = read_values_per_line::<f64>(&args.snpcountsfile)?;
+    let total_gd = read_values_per_line::<f64>(&args.maplengthsfile)?;
+
+    if chr_filenames.len() != total_snp.len() || chr_filenames.len() != total_gd.len() {
+        return Err(CombineError::Message(format!(
+            "{}, {}, and {} must all have the same number of lines (one per input file)",
+            &args.chunkpathsfile, &args.snpcountsfile, &args.maplengthsfile
+        )));
+    }
+
     // Per-chromosome weight: genetic map length / SNP count, rounded to 6 d.p.
     let weights: Vec<f64> = total_gd
         .iter()
@@ -132,43 +168,37 @@ fn run<WS: Write + Send + 'static, W: Write>(
 
     // Accumulate weighted chunk lengths across all chromosomes.
     let mut cl = HMat::new();
-    for i in 0..chr_filenames.len() {
-        println!("Loading chromosome {}", i + 1); // TODO change this so it prints the filename
-        read_data(&chr_filenames[i], &mut cl, weights[i]);
+    for (i, path) in chr_filenames.iter().enumerate() {
+        eprintln!("Loading data from {}", filename_from_path(path));
+        read_pbwt_out(path, &mut cl, weights[i])?;
     }
-    println!("Loading chromosomes complete");
+    eprintln!("Loading data complete");
 
-    // -----------------------------------------------------------------------
-    // Pass 1: collect all values that survive the static threshold (>= 0.000005)
-    // and compute per-row sums before any dynamic exclusion.
-    //
-    // The row sums represent the true total weighted copying for each individual
-    // (subject only to the static floor). They are written to a separate file so
-    // that downstream consumers can use them as the correct normalisation
-    // denominator even when the dynamic threshold further reduces the matrix.
-    // -----------------------------------------------------------------------
-    let mut all_values: Vec<f64> = Vec::new();
-    let mut row_sums: Vec<f64> = vec![0.0; nind];
+    let output_path = format!("{}.txt.gz", &args.out);
+    let output_file = File::create(&output_path)?;
 
-    // for i in 0..nind {
-    //     for (&_j, &val) in &cl.get(i).v {
-    //         if val >= 0.000005 {
-    //             row_sums[i] += val;
-    //             all_values.push(val);
-    //         }
-    //     }
-    // }
+    if args.writerowsums {
+        let rowsums_path = format!("{}.rowsums", &args.out);
+        let rowsums_file = File::create(&rowsums_path)?;
 
-    println!("Calculating row sums");
-    for (i, row) in &cl.m {
-        for (_j, val) in &row.v {
-            if *val >= 0.000005 {
-                row_sums[*i] += val;
-                all_values.push(*val);
-            }
+        let row_sums = calculate_rowsums(&cl, args.nsample);
+
+        // -----------------------------------------------------------------------
+        // Write row sums.
+        //
+        // Contains one value per line (individual 1 on line 1, etc.) representing
+        // the sum of all entries in that row that survived the static threshold,
+        // before any dynamic exclusion. Downstream code should use these as the
+        // normalisation denominator rather than recomputing from the (possibly
+        // truncated) output matrix.
+        // -----------------------------------------------------------------------
+        eprintln!("Writing row sums");
+        let mut rowsums_writer = BufWriter::new(rowsums_file);
+        for &rs in &row_sums {
+            writeln!(rowsums_writer, "{:.5}", rs)?;
         }
+        eprintln!("Writing row sums complete");
     }
-    println!("Calculating row sums complete");
 
     // -----------------------------------------------------------------------
     // Determine dynamic threshold.
@@ -181,249 +211,202 @@ fn run<WS: Write + Send + 'static, W: Write>(
     // Note: if there are ties at the threshold value, more than the minimum
     // number of entries may be dropped, but the count is guaranteed < 2^31.
     // -----------------------------------------------------------------------
-    println!("Determining dynamic threshold");
-    let dynamic_threshold: f64 = if all_values.len() >= (1usize << 31) {
-        let n_to_drop = all_values.len() - MAX_ENTRIES;
-        // select_nth_unstable_by(k) rearranges all_values so that the element
-        // at sorted position k is in place. Elements before it are <= it and
-        // elements after are >= it. We then keep entries strictly > threshold,
-        // guaranteeing at most MAX_ENTRIES entries in the output.
-        // f64 doesn't implement Ord (due to NaN), so we use partial_cmp.
-        // The unwrap is safe: all values here are finite (>= 0.000005).
-        let threshold = *all_values
-            .select_nth_unstable_by(n_to_drop - 1, |a, b| a.partial_cmp(b).unwrap())
-            .1;
-        eprintln!(
-            "Note: {} entries survive the static threshold (>= 2^31); \
-             applying dynamic threshold {:.6} to drop at least {} entries.",
-            all_values.len(),
-            threshold,
-            n_to_drop
-        );
-        threshold
+    let dynamic_threshold: f64 = if let Some(n) = nrows {
+        get_dynamic_threshold(&cl, n)
     } else {
-        // No dynamic exclusion needed; use -infinity so the condition
-        // `val > dynamic_threshold` is always satisfied for finite values.
+        eprintln!("No dynamic threshold needed");
         f64::NEG_INFINITY
     };
-    println!("Determining dynamic threshold complete");
 
     // -----------------------------------------------------------------------
     // Pass 2: write the output matrix, applying both thresholds.
     //
     // An entry is written iff:
     //   val >= 0.000005          (static threshold, always applied)
-    //   val > dynamic_threshold  (only active when total entries >= 2^31)
+    //   val > dynamic_threshold  (only active when total entries >= args.restrictrows)
     // -----------------------------------------------------------------------
 
-    // println!("Writing output matrix");
-    // for i in 0..nind {
-    //     // TODO: sort by indices to print in order?
-    //     for (&j, &val) in &cl.get(i).v {
-    //         if val >= 0.000005 && val > dynamic_threshold {
-    //             writeln!(writer, "{} {} {:.5}", i + 1, j + 1, val).unwrap();
-    //         }
-    //     }
-    // }
+    let writer = BufWriter::new(Box::new(output_file));
+    eprintln!("Writing output matrix");
+    parallel_read_write(args.threads, cl, writer, dynamic_threshold)?;
 
-    // let mut writer = BufWriter::new(GzEncoder::new(out, Compression::default()));
-    // let mut writer = BufWriter::new(out);
+    Ok(())
+}
 
-    // println!("Writing output matrix");
-    // for (i, row) in cl.m {
-    //     for (j, val) in row.v {
-    //         if val >= 0.000005 && val > dynamic_threshold {
-    //             writeln!(writer, "{} {} {:.5}", i + 1, j + 1, val).unwrap();
-    //         }
-    //     }
-    // }
-
-    // let writer = BufWriter::new(out);
-
-    // let mut parz = ZBuilder::<Gzip, _>::new()
-    //     .num_threads(8)
-    //     .from_writer(writer);
-
-    // println!("Writing output matrix");
-    // for (i, row) in cl.m {
-    //     for (j, val) in row.v {
-    //         if val >= 0.000005 && val > dynamic_threshold {
-    //             parz.write_all(format!("{} {} {:.5}\n", i + 1, j + 1, val).as_bytes())
-    //                 .unwrap();
-    //         }
-    //     }
-    // }
-    // parz.finish().unwrap();
-
-    // let writer = BufWriter::new(GzEncoder::new(Box::new(out), Compression::default()));
-    let writer = BufWriter::new(Box::new(out));
-    println!("Writing output matrix");
-    parallel_read_write(10, cl, writer, dynamic_threshold);
-
-    // println!("Writing output matrix");
-    // cl.m.par_iter()
-    //     .map(|(i, row): (&usize, &HVec)| -> Vec<u8> {
-    //         let mut buffer = Vec::new();
-    //         for (j, val) in &row.v {
-    //             if *val >= 0.000005 && *val > dynamic_threshold {
-    //                 writeln!(buffer, "{} {} {:.5}", i + 1, j + 1, *val).unwrap();
-    //             }
-    //         }
-    //         buffer
-    //     })
-    //     .collect::<Vec<Vec<u8>>>()
-    //     .into_iter()
-    //     .for_each(|buffer| {
-    //         writer.write_all(&buffer).unwrap();
-    //     });
-
-    // -----------------------------------------------------------------------
-    // Write row sums.
-    //
-    // Contains one value per line (individual 1 on line 1, etc.) representing
-    // the sum of all entries in that row that survived the static threshold,
-    // before any dynamic exclusion. Downstream code should use these as the
-    // normalisation denominator rather than recomputing from the (possibly
-    // truncated) output matrix.
-    // -----------------------------------------------------------------------
-    println!("Writing row sums");
-    let mut rowsums_writer = BufWriter::new(rowsums_out);
-    for &rs in &row_sums {
-        writeln!(rowsums_writer, "{:.5}", rs).unwrap();
+fn calculate_rowsums(cl: &HMat, nind: usize) -> Vec<f64> {
+    eprintln!("Calculating row sums");
+    let mut row_sums: Vec<f64> = vec![0.0; nind];
+    for (i, row) in &cl.m {
+        for val in row.v.values() {
+            if *val >= 0.000005 {
+                row_sums[*i] += *val;
+            }
+        }
     }
+    eprintln!("Calculating row sums complete");
+    row_sums
+}
+
+/// Returns threshold below which to exclude values from the output if there are more
+/// rows in the input than are permitted in the output
+fn get_dynamic_threshold(cl: &HMat, nrows: usize) -> f64 {
+    eprintln!("Determining dynamic threshold");
+    let mut all_values: Vec<f64> =
+        cl.m.values()
+            .flat_map(|row| row.v.values())
+            .copied()
+            .collect();
+
+    let total_length = all_values.len();
+
+    let dynamic_threshold: f64 = if all_values.len() >= nrows {
+        let n_to_drop = total_length - nrows;
+        // select_nth_unstable_by(k) rearranges all_values so that the element
+        // at sorted position k is in place. Elements before it are <= it and
+        // elements after are >= it. We then keep entries strictly > threshold,
+        // guaranteeing at most MAX_ENTRIES entries in the output.
+        // f64 doesn't implement Ord (due to NaN), so we use partial_cmp.
+        // The unwrap is safe: all values here are finite (>= 0.000005).
+        let threshold = all_values
+            .select_nth_unstable_by(n_to_drop - 1, |a, b| a.partial_cmp(b).unwrap())
+            .1;
+        eprintln!(
+            "Note: {} entries survive the static threshold (>= 2^31); \
+             applying dynamic threshold {:.6} to drop at least {} entries.",
+            total_length, threshold, n_to_drop
+        );
+        *threshold
+    } else {
+        // No dynamic exclusion needed; use -infinity so the condition
+        // `val > dynamic_threshold` is always satisfied for finite values.
+        f64::NEG_INFINITY
+    };
+
+    eprintln!("Determining dynamic threshold complete");
+    dynamic_threshold
 }
 
 // ---------------------------------------------------------------------------
-// CLI entry point
+// I/O helpers
 // ---------------------------------------------------------------------------
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+/// Read one whitespace-trimmed token per non-blank line into a Vec<T>.
+fn read_values_per_line<T>(path: &str) -> Result<Vec<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Debug,
+{
+    let file = open_file_or_err(path)?;
+    let reader = BufReader::new(file);
+    let mut values = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: T = trimmed.parse().map_err(|e| {
+            CombineError::Message(format!(
+                "could not parse '{}' from {}: {:?}",
+                trimmed, path, e
+            ))
+        })?;
+        values.push(value);
+    }
+    Ok(values)
+}
 
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!(
-            "Usage: {} <chr_chunks_filenames_list> <chr_snp_counts_list> <chr_map_lengths_list> <nind> <outfile>",
-            args[0]
-        );
-        println!("  Row sums (pre-dynamic-exclusion) are written to <outfile>.rowsums");
-        return;
+/// Read a per-chromosome painting file, accumulating value * weight
+/// into existing entries or creating new ones.
+fn read_pbwt_out(path: &str, cl: &mut HMat, weight: f64) -> Result<()> {
+    let file = open_file_or_err(path)?;
+    let reader = BufReader::new(GzDecoder::new(file));
+
+    for line in reader.lines() {
+        let line = line?;
+        let parts: Vec<_> = line.split_ascii_whitespace().collect();
+        if parts.len() != 3 {
+            return Err(CombineError::Message(format!(
+                "invalid line: {}, in {}",
+                line,
+                filename_from_path(path)
+            )));
+        }
+        let ind1: usize = parts[0].parse()?;
+        let ind2: usize = parts[1].parse()?;
+        let value: f64 = parts[2].parse()?;
+
+        cl.get(ind1 - 1).add(ind2 - 1, value * weight);
     }
 
-    if args.len() != 6 {
-        eprintln!(
-            "Usage: {} <chr_chunks_filenames_list> <chr_snp_counts_list> <chr_map_lengths_list> <nind> <outfile>",
-            args[0]
-        );
-        std::process::exit(1);
-    }
+    Ok(())
+}
 
-    let filenames_list = &args[1];
-    let snp_counts_list = &args[2];
-    let map_lengths_list = &args[3];
-    let nind: usize = args[4].parse().unwrap_or_else(|_| {
-        eprintln!("Error: <nind> must be a positive integer");
-        std::process::exit(1);
-    });
-    let outfile = &args[5];
+fn open_file_or_err(path: &str) -> Result<File> {
+    File::open(path).map_err(|e| {
+        CombineError::Message(format!(
+            "could not open {}: {}",
+            filename_from_path(path),
+            e
+        ))
+    })
+}
 
-    let chr_filenames = read_values_per_line::<String>(filenames_list);
-    let total_snp = read_values_per_line::<f64>(snp_counts_list);
-    let total_gd = read_values_per_line::<f64>(map_lengths_list);
-
-    if chr_filenames.len() != total_snp.len() || chr_filenames.len() != total_gd.len() {
-        eprintln!(
-            "Error: {}, {} and {} must all have the same number of lines (one per chromosome)",
-            filenames_list, snp_counts_list, map_lengths_list
-        );
-        std::process::exit(1);
-    }
-
-    let out = File::create(outfile).unwrap_or_else(|e| {
-        eprintln!("Error: could not create {}: {}", outfile, e);
-        std::process::exit(1)
-    });
-
-    let rowsums_path = format!("{}.rowsums", outfile);
-    let rowsums_out = File::create(&rowsums_path).unwrap_or_else(|e| {
-        eprintln!("Error: could not create {}: {}", rowsums_path, e);
-        std::process::exit(1)
-    });
-
-    run(
-        &chr_filenames,
-        &total_snp,
-        &total_gd,
-        nind,
-        out,
-        rowsums_out,
-    );
+fn filename_from_path(path: &str) -> &str {
+    path.split('/').next_back().unwrap_or(path)
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use std::io::BufReader;
-//     use std::path::PathBuf;
-// use std::sync::{Arc, Mutex};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufReader;
+    use std::path::PathBuf;
 
-//     fn testdata(filename: &str) -> String {
-//         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-//             .join("testdata")
-//             .join("n10000")
-//             .join(filename)
-//             .to_string_lossy()
-//             .into_owned()
-//     }
+    #[test]
+    fn verify_cli() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+    }
 
-//     /// Decompress a gzipped byte slice and return the lines as a Vec<String>.
-//     fn decode_gz(bytes: &[u8]) -> Vec<String> {
-//         let reader = BufReader::new(GzDecoder::new(bytes));
-//         let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
-//         lines
-//     }
+    /// Returns the path to a testdata file relative to the project root.
+    fn testdata(filename: &str) -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(filename)
+            .to_string_lossy()
+            .into_owned()
+    }
 
-//     fn load_f64_vec(filename: &str) -> Vec<f64> {
-//         let mut vec: Vec<f64> = Vec::new();
-//         let mut file = std::fs::File::open(filename).unwrap();
-//         let reader = std::io::BufReader::new(&mut file);
-//         for line in reader.lines() {
-//             let line = line.unwrap();
-//             vec.push(line.parse().unwrap());
-//         }
-//         vec
-//     }
+    /// Decompress a gzipped byte slice and return the lines as a Vec<String>.
+    fn decode_gz(bytes: &[u8]) -> Vec<String> {
+        let reader = BufReader::new(GzDecoder::new(bytes));
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+        lines
+    }
 
-//     #[test]
-//     fn test_combine_matches_expected() {
-//         let chr_filenames = vec![
-//             testdata("chr01.chunklengths.s.out.gz"),
-//             testdata("chr02.chunklengths.s.out.gz"),
-//             testdata("chr03.chunklengths.s.out.gz"),
-//             testdata("chr04.chunklengths.s.out.gz"),
-//             testdata("chr05.chunklengths.s.out.gz"),
-//         ];
-//         let total_snp = load_f64_vec(&testdata("nsnps.txt"));
-//         let total_gd = load_f64_vec(&testdata("chr1-5.maplengths.txt"));
-//         let nind = 10000;
+    // The testdata directory contains synthetic data for testing purposes.
+    // As a consequence, the rows don't sum to the expected total.
+    #[test]
+    #[rustfmt::skip]
+    fn test_combine_matches_expected() {
+        let args = Args::parse_from([
+            "combine",
+            "--chunkpathsfile", &testdata("chunks.filelist.txt"),
+            "--snpcountsfile", &testdata("nsnps.txt"),
+            "--maplengthsfile", &testdata("map_lengths.txt"),
+            "--nsample", "2000",
+            "--out", &testdata("combined"),
+        ]);
 
-//         let out_buf = Vec::new();
-//         let mut rowsums_buf: Vec<u8> = Vec::new();
-//         run(
-//             &chr_filenames,
-//             &total_snp,
-//             &total_gd,
-//             nind,
-//             out_buf,
-//             &mut rowsums_buf,
-//         );
+        run(args).unwrap();
 
-//         let actual = decode_gz(&out_buf);
-//         let expected = decode_gz(&std::fs::read(testdata("combined.chunklengths.txt.gz")).unwrap());
+        let actual = decode_gz(&std::fs::read(testdata("combined.txt.gz")).unwrap());
+        let expected = decode_gz(&std::fs::read(testdata("expected.txt.gz")).unwrap());
 
-//         assert_eq!(actual, expected);
-//     }
-// }
+        assert_eq!(actual, expected);
+    }
+}
