@@ -1,0 +1,5 @@
+testdata/chr1.chunks.txt.gz
+testdata/chr2.chunks.txt.gz
+testdata/chr3.chunks.txt.gz
+testdata/chr4.chunks.txt.gz
+testdata/chr5.chunks.txt.gz
