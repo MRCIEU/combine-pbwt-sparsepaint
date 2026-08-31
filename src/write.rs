@@ -21,6 +21,7 @@ pub(crate) struct RowLocation {
 pub(crate) struct WriteData {
     idx: usize,
     data: Vec<u8>,
+    rowsum: Option<f64>,
 }
 
 // Splits the number of threads into gzip and read matrix threads.
@@ -35,15 +36,19 @@ fn split_n_threads(nthreads: usize) -> (usize, usize) {
 pub fn parallel_read_write<BW: Write + Send + 'static>(
     nthreads: usize,
     cl: HMat,
-    writer: BW,
+    hap_writer: BW,
+    rowsum_writer: Option<BW>,
     dynamic_threshold: f64,
+    write_rowsums: bool,
 ) -> Result<()> {
     let (txrl, rxrl) = bounded::<RowLocation>(nthreads);
     let (txwd, rxwd) = bounded::<WriteData>(nthreads);
 
     let (gzip_threads, read_mat_threads) = split_n_threads(nthreads);
 
-    let writer_thread = thread::spawn(move || gather_parallel_write(&rxwd, writer, gzip_threads));
+    let writer_thread = thread::spawn(move || {
+        gather_parallel_write(&rxwd, hap_writer, rowsum_writer, gzip_threads)
+    });
 
     let keys = cl.m.keys().cloned().collect::<Vec<usize>>();
 
@@ -73,7 +78,7 @@ pub fn parallel_read_write<BW: Write + Send + 'static>(
             let wg = waitgroup.clone();
             let arc = arc.clone();
             thread::spawn(move || {
-                let result = get_row(&rxrl, &txwd, arc, dynamic_threshold);
+                let result = get_row(&rxrl, &txwd, arc, dynamic_threshold, write_rowsums);
                 drop(wg);
                 result
             })
@@ -101,18 +106,34 @@ fn get_row(
     txwd: &Sender<WriteData>,
     cl: Arc<RwLock<HMat>>,
     dynamic_threshold: f64,
+    write_rowsums: bool,
 ) -> Result<()> {
     for rl in rxrl.iter() {
         let row = cl.read()?.m.get(&rl.key).unwrap().v.clone();
         let mut buffer = Vec::new();
+        let mut write_this_rowsum = write_rowsums;
+        let mut rowsum = 0.0;
         for (j, val) in row {
-            if val >= 0.000005 && val > dynamic_threshold {
-                writeln!(buffer, "{} {} {:.5}", rl.key + 1, j + 1, val)?;
+            if val >= 0.000005 {
+                if write_rowsums {
+                    rowsum += val;
+                }
+                if val > dynamic_threshold {
+                    writeln!(buffer, "{} {} {:.5}", rl.key + 1, j + 1, val)?;
+                }
             }
+        }
+        if buffer.is_empty() {
+            write_this_rowsum = false;
         }
         let wd = WriteData {
             idx: rl.idx,
             data: buffer,
+            rowsum: if write_this_rowsum {
+                Some(rowsum)
+            } else {
+                None
+            },
         };
         txwd.send(wd)?;
     }
@@ -123,7 +144,8 @@ fn get_row(
 // The gzip writer built here is a multi-threaded gzip writer from the gzp crate
 fn gather_parallel_write<W: Write + Send + 'static>(
     rxwd: &Receiver<WriteData>,
-    writer: W,
+    hap_writer: W,
+    mut rowsum_writer: Option<W>,
     nthreads: usize,
 ) -> Result<()> {
     let mut m: HashMap<usize, WriteData> = HashMap::new();
@@ -132,13 +154,18 @@ fn gather_parallel_write<W: Write + Send + 'static>(
 
     let mut parz = ZBuilder::<Gzip, _>::new()
         .num_threads(nthreads)
-        .from_writer(writer);
+        .from_writer(hap_writer);
 
     for r in rxwd.iter() {
         m.insert(r.idx, r);
         while m.contains_key(&counter) {
             if let Some(rv) = m.remove(&counter) {
                 parz.write_all(&rv.data)?;
+                if let Some(rowsum_writer) = &mut rowsum_writer {
+                    if let Some(rowsum) = rv.rowsum {
+                        writeln!(rowsum_writer, "{:.5}", rowsum)?;
+                    }
+                }
                 counter += 1;
             } else {
                 return Err(CombineError::Message(
@@ -149,6 +176,9 @@ fn gather_parallel_write<W: Write + Send + 'static>(
     }
 
     parz.finish()?;
+    if let Some(rowsum_writer) = &mut rowsum_writer {
+        rowsum_writer.flush()?;
+    }
 
     Ok(())
 }

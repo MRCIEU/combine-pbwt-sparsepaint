@@ -3,7 +3,7 @@ use flate2::read::GzDecoder;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter};
 use thiserror::Error;
 
 mod write;
@@ -105,10 +105,6 @@ struct Args {
     #[arg(short, long, required = true)]
     maplengthsfile: String,
 
-    /// The total number of samples.
-    #[arg(short, long, required = true)]
-    nsample: usize,
-
     /// The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
     #[arg(short, long, default_missing_value = "2147483648", num_args = 0..=1, require_equals = true)]
     restrictrows: Option<usize>,
@@ -177,28 +173,14 @@ fn run(mut args: Args) -> Result<()> {
     let output_path = format!("{}.txt.gz", &args.out);
     let output_file = File::create(&output_path)?;
 
-    if args.writerowsums {
-        let rowsums_path = format!("{}.rowsums", &args.out);
-        let rowsums_file = File::create(&rowsums_path)?;
-
-        let row_sums = calculate_rowsums(&cl, args.nsample);
-
-        // -----------------------------------------------------------------------
-        // Write row sums.
-        //
-        // Contains one value per line (individual 1 on line 1, etc.) representing
-        // the sum of all entries in that row that survived the static threshold,
-        // before any dynamic exclusion. Downstream code should use these as the
-        // normalisation denominator rather than recomputing from the (possibly
-        // truncated) output matrix.
-        // -----------------------------------------------------------------------
-        eprintln!("Writing row sums");
-        let mut rowsums_writer = BufWriter::new(rowsums_file);
-        for &rs in &row_sums {
-            writeln!(rowsums_writer, "{:.5}", rs)?;
-        }
-        eprintln!("Writing row sums complete");
-    }
+    let rowsums_writer = if args.writerowsums {
+        Some(BufWriter::new(Box::new(File::create(format!(
+            "{}.rowsums",
+            &args.out
+        ))?)))
+    } else {
+        None
+    };
 
     // -----------------------------------------------------------------------
     // Determine dynamic threshold.
@@ -226,29 +208,22 @@ fn run(mut args: Args) -> Result<()> {
     //   val > dynamic_threshold  (only active when total entries >= args.restrictrows)
     // -----------------------------------------------------------------------
 
-    let writer = BufWriter::new(Box::new(output_file));
+    let hap_writer = BufWriter::new(Box::new(output_file));
     eprintln!("Writing output matrix");
-    parallel_read_write(args.threads, cl, writer, dynamic_threshold)?;
+    parallel_read_write(
+        args.threads,
+        cl,
+        hap_writer,
+        rowsums_writer,
+        dynamic_threshold,
+        args.writerowsums,
+    )?;
 
     Ok(())
 }
 
-fn calculate_rowsums(cl: &HMat, nind: usize) -> Vec<f64> {
-    eprintln!("Calculating row sums");
-    let mut row_sums: Vec<f64> = vec![0.0; nind];
-    for (i, row) in &cl.m {
-        for val in row.v.values() {
-            if *val >= 0.000005 {
-                row_sums[*i] += *val;
-            }
-        }
-    }
-    eprintln!("Calculating row sums complete");
-    row_sums
-}
-
 /// Returns threshold below which to exclude values from the output if there are more
-/// rows in the input than are permitted in the output
+/// rows in the input than are permitted
 fn get_dynamic_threshold(cl: &HMat, nrows: usize) -> f64 {
     eprintln!("Determining dynamic threshold");
     let mut all_values: Vec<f64> =
@@ -363,6 +338,7 @@ fn filename_from_path(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use itertools::Itertools;
     use std::io::BufReader;
     use std::path::PathBuf;
 
@@ -372,7 +348,6 @@ mod tests {
         Args::command().debug_assert();
     }
 
-    /// Returns the path to a testdata file relative to the project root.
     fn testdata(filename: &str) -> String {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
@@ -381,32 +356,143 @@ mod tests {
             .into_owned()
     }
 
-    /// Decompress a gzipped byte slice and return the lines as a Vec<String>.
-    fn decode_gz(bytes: &[u8]) -> Vec<String> {
-        let reader = BufReader::new(GzDecoder::new(bytes));
-        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
-        lines
+    /// Read a file (optionally gzipped) and return the lines as a Vec<String>.
+    fn file_2_lines(bytes: &[u8], gz: bool) -> Vec<String> {
+        if gz {
+            BufReader::new(GzDecoder::new(bytes))
+                .lines()
+                .map(|l| l.unwrap())
+                .collect()
+        } else {
+            BufReader::new(bytes).lines().map(|l| l.unwrap()).collect()
+        }
     }
 
-    // The testdata directory contains synthetic data for testing purposes.
-    // As a consequence, the rows don't sum to the expected total.
+    /// Return the number of unique row indices in the output data.
+    fn get_nrows(data: Vec<String>) -> usize {
+        data.iter()
+            .map(|s| {
+                s.split_ascii_whitespace()
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .unique()
+            .count()
+    }
+
     #[test]
     #[rustfmt::skip]
     fn test_combine_matches_expected() {
         let args = Args::parse_from([
             "combine",
-            "--chunkpathsfile", &testdata("chunks.filelist.txt"),
+            "--chunkpathsfile", &testdata("chunklength.files.txt"),
             "--snpcountsfile", &testdata("nsnps.txt"),
             "--maplengthsfile", &testdata("map_lengths.txt"),
-            "--nsample", "2000",
             "--out", &testdata("combined"),
         ]);
 
         run(args).unwrap();
 
-        let actual = decode_gz(&std::fs::read(testdata("combined.txt.gz")).unwrap());
-        let expected = decode_gz(&std::fs::read(testdata("expected.txt.gz")).unwrap());
+        let actual = file_2_lines(&std::fs::read(testdata("combined.txt.gz")).unwrap(), true);
+        let expected = file_2_lines(&std::fs::read(testdata("expected.rust.txt.gz")).unwrap(), true);
 
         assert_eq!(actual, expected);
+
+        std::fs::remove_file(testdata("combined.txt.gz")).unwrap();
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_combine_matches_expected_r() {
+        let args = Args::parse_from([
+            "combine",
+            "--chunkpathsfile", &testdata("chunklength.files.txt"),
+            "--snpcountsfile", &testdata("nsnps.txt"),
+            "--maplengthsfile", &testdata("map_lengths.txt"),
+            "--writerowsums",
+            "--out", &testdata("combined.r"),
+        ]);
+
+        run(args).unwrap();
+
+        let actual = file_2_lines(&std::fs::read(testdata("combined.r.txt.gz")).unwrap(), true);
+        let expected = file_2_lines(&std::fs::read(testdata("expected.rust.txt.gz")).unwrap(), true);
+
+        assert_eq!(actual, expected);
+
+        let actual_rowsums = file_2_lines(&std::fs::read(testdata("combined.r.rowsums")).unwrap(), false);
+
+        assert_eq!(get_nrows(actual), actual_rowsums.len());
+
+        std::fs::remove_file(testdata("combined.r.txt.gz")).unwrap();
+        std::fs::remove_file(testdata("combined.r.rowsums")).unwrap();
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_combine_matches_expected_r_10000() {
+        let args = Args::parse_from([
+            "combine",
+            "--chunkpathsfile", &testdata("chunklength.files.txt"),
+            "--snpcountsfile", &testdata("nsnps.txt"),
+            "--maplengthsfile", &testdata("map_lengths.txt"),
+            "--restrictrows=10000",
+            "--out", &testdata("combined.r.10000"),
+        ]);
+
+        run(args).unwrap();
+
+        let actual = file_2_lines(&std::fs::read(testdata("combined.r.10000.txt.gz")).unwrap(), true);
+        assert!(actual.len() <= 10000);
+
+        let actual_rowsums = file_2_lines(&std::fs::read(testdata("combined.r.10000.rowsums")).unwrap(), false);
+
+        assert_eq!(get_nrows(actual), actual_rowsums.len());
+
+        std::fs::remove_file(testdata("combined.r.10000.txt.gz")).unwrap();
+        std::fs::remove_file(testdata("combined.r.10000.rowsums")).unwrap();
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_combine_matches_expected_cpp() {
+        let args = Args::parse_from([
+            "combine",
+            "--chunkpathsfile", &testdata("chunklength.files.txt"),
+            "--snpcountsfile", &testdata("nsnps.txt"),
+            "--maplengthsfile", &testdata("map_lengths.txt"),
+            "--writerowsums",
+            "--out", &testdata("combined.cpp"),
+        ]);
+
+        run(args).unwrap();
+
+        let actual = file_2_lines(&std::fs::read(testdata("combined.cpp.txt.gz")).unwrap(), true);
+        let expected = file_2_lines(&std::fs::read(testdata("expected.cpp.sorted.txt.gz")).unwrap(), true);
+
+        assert_eq!(actual.len(), expected.len());
+
+        // there are rounding differences due to floating point precision between the rust implementation and the cpp implementation
+        let actual_values_rounded = actual.iter().map(|l| l.split_whitespace().next().unwrap().parse::<f64>().unwrap().round()).collect::<Vec<_>>();
+        let expected_values_rounded = expected.iter().map(|l| l.split_whitespace().next().unwrap().parse::<f64>().unwrap().round()).collect::<Vec<_>>();
+
+        assert_eq!(actual_values_rounded, expected_values_rounded);
+
+        let actual_rowsums = file_2_lines(&std::fs::read(testdata("combined.cpp.rowsums")).unwrap(), false);
+        let expected_rowsums = file_2_lines(&std::fs::read(testdata("expected.cpp.sorted.rowsums")).unwrap(), false);
+
+        assert_eq!(actual_rowsums.len(), expected_rowsums.len());
+
+        // there are rounding differences due to floating point precision between the rust implementation and the cpp implementation
+        let actual_rowsums_rounded = actual_rowsums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
+        let expected_rowsums_rounded = expected_rowsums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
+
+        assert_eq!(actual_rowsums_rounded, expected_rowsums_rounded);
+
+        std::fs::remove_file(testdata("combined.cpp.txt.gz")).unwrap();
+        std::fs::remove_file(testdata("combined.cpp.rowsums")).unwrap();
     }
 }
