@@ -1,11 +1,10 @@
+use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_utils::sync::WaitGroup;
 use gzp::{ZBuilder, deflate::Gzip};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, RwLock};
 use std::thread;
-
-use crossbeam_channel::{Receiver, Sender, bounded};
-use crossbeam_utils::sync::WaitGroup;
 
 use crate::{CombineError, HMat, Result};
 
