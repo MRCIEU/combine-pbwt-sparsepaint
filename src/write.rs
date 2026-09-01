@@ -33,7 +33,7 @@ fn split_n_threads(nthreads: usize) -> (usize, usize) {
 }
 
 // Top level logic for parallel sparse matrix reading + parallel gzip writing (using multiple threads).
-pub fn parallel_read_write<BW: Write + Send + 'static>(
+pub(crate) fn parallel_read_write<BW: Write + Send + 'static>(
     nthreads: usize,
     cl: HMat,
     hap_writer: BW,

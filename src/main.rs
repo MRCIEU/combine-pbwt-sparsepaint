@@ -170,18 +170,6 @@ fn run(mut args: Args) -> Result<()> {
     }
     eprintln!("Loading data complete");
 
-    let output_path = format!("{}.txt.gz", &args.out);
-    let output_file = File::create(&output_path)?;
-
-    let rowsums_writer = if args.writerowsums {
-        Some(BufWriter::new(Box::new(File::create(format!(
-            "{}.rowsums",
-            &args.out
-        ))?)))
-    } else {
-        None
-    };
-
     // -----------------------------------------------------------------------
     // Determine dynamic threshold.
     //
@@ -209,7 +197,19 @@ fn run(mut args: Args) -> Result<()> {
     //   val > dynamic_threshold  (only active when total entries >= args.restrictrows)
     // -----------------------------------------------------------------------
 
+    let output_path = format!("{}.txt.gz", &args.out);
+    let output_file = File::create(&output_path)?;
     let hap_writer = BufWriter::new(Box::new(output_file));
+
+    let rowsums_writer = if args.writerowsums {
+        Some(BufWriter::new(Box::new(File::create(format!(
+            "{}.rowsums",
+            &args.out
+        ))?)))
+    } else {
+        None
+    };
+
     eprintln!("Writing output matrix");
     parallel_read_write(
         args.threads,
