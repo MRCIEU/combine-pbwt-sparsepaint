@@ -113,6 +113,7 @@ fn get_row(
         let mut buffer = Vec::new();
         let mut write_this_rowsum = write_rowsums;
         let mut rowsum = 0.0;
+
         for (j, val) in row {
             if val >= 0.000005 {
                 if write_rowsums {
@@ -161,10 +162,10 @@ fn gather_parallel_write<W: Write + Send + 'static>(
         while m.contains_key(&counter) {
             if let Some(rv) = m.remove(&counter) {
                 parz.write_all(&rv.data)?;
-                if let Some(rowsum_writer) = &mut rowsum_writer {
-                    if let Some(rowsum) = rv.rowsum {
-                        writeln!(rowsum_writer, "{:.5}", rowsum)?;
-                    }
+                if let Some(rowsum_writer) = &mut rowsum_writer
+                    && let Some(rowsum) = rv.rowsum
+                {
+                    writeln!(rowsum_writer, "{:.5}", rowsum)?;
                 }
                 counter += 1;
             } else {

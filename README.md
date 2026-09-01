@@ -87,7 +87,7 @@ The rowsums file is a plain text file called `<PREFIX>.rowsums`. It contains the
 
 ## Help
 
-```sh
+```
 ❯ combine -h
 Usage: combine [OPTIONS] --chunkpathsfile <CHUNKPATHSFILE> --snpcountsfile <SNPCOUNTSFILE> --maplengthsfile <MAPLENGTHSFILE> --nsample <NSAMPLE>
 

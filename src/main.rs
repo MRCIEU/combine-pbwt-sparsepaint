@@ -185,13 +185,14 @@ fn run(mut args: Args) -> Result<()> {
     // -----------------------------------------------------------------------
     // Determine dynamic threshold.
     //
-    // If the number of entries surviving the static threshold is >= 2^31, we
-    // must drop additional entries (the smallest ones) until fewer than 2^31
-    // remain. We find the exact cut-off value using a linear-time selection
-    // algorithm, then keep only entries strictly above it.
+    // If --restrictrows is set, and the number of entries surviving the static
+    // threshold is >= args.restrictrows, we must drop additional entries (the
+    // smallest ones) until fewer than args.restrictrows remain. We find the exact
+    // cut-off value using a linear-time selection algorithm, then keep only
+    // entries strictly above it.
     //
     // Note: if there are ties at the threshold value, more than the minimum
-    // number of entries may be dropped, but the count is guaranteed < 2^31.
+    // number of entries may be dropped, but the count is guaranteed < args.restrictrows.
     // -----------------------------------------------------------------------
     let dynamic_threshold: f64 = if let Some(n) = nrows {
         get_dynamic_threshold(&cl, n)
