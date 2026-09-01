@@ -12,7 +12,7 @@ Documentation for the original haplotype component calculation pipeline [can be 
 
 1) (phased) VCF -> per-chromosome sparse matrices of haplotype sharing lengths (in number of SNPs) using [pbwt](https://github.com/richarddurbin/pbwt)
 2) per-chromosome sparse matrices of haplotype sharing lengths (in number of SNPs) -> total sparse matrix of haplotype sharing lengths (in map units)
-3) sparse matrix of haplotype sharing lengths (in map units) -> haplotype components (HCs) using single vector decomposition (in R)
+3) sparse matrix of haplotype sharing lengths (in map units) -> haplotype components (HCs) using singular value decomposition
 
 The program in this repository performs step 2.
 
