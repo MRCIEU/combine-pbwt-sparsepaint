@@ -89,7 +89,7 @@ The rowsums file is a plain text file called `<PREFIX>.rowsums`. It contains the
 
 ```
 ❯ combine -h
-Usage: combine [OPTIONS] --chunkpathsfile <CHUNKPATHSFILE> --snpcountsfile <SNPCOUNTSFILE> --maplengthsfile <MAPLENGTHSFILE> --nsample <NSAMPLE>
+Usage: combine [OPTIONS] --chunkpathsfile <CHUNKPATHSFILE> --snpcountsfile <SNPCOUNTSFILE> --maplengthsfile <MAPLENGTHSFILE>
 
 Options:
   -c, --chunkpathsfile <CHUNKPATHSFILE>
