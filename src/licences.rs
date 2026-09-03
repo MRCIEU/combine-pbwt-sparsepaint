@@ -1,23 +1,43 @@
 pub(crate) fn print_licences() {
     println!("{}", LICENCE);
     println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("");
     println!(
-        "This program refactors some of the code in https://github.com/YaolingYang/SparsePainter, which is licensed under the GPL-3.0."
+        "combine is derived from some of the code in https://github.com/YaolingYang/SparsePainter,\nwhich is licensed under GNU GPL-3.0:"
     );
+    println!("");
     println!("{}", LICENCE_SPARSEPAINTER);
     println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("");
     println!("As well as the following software:");
+    println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("");
     println!("{}", LICENCE_CLAP);
+    println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("");
     println!("{}", LICENCE_CROSSBEAM_CHANNEL);
     println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("");
     println!("{}", LICENCE_CROSSBEAM_UTILS);
+    println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("");
     println!("{}", LICENCE_FLATE2);
     println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("");
     println!("{}", LICENCE_GZP);
     println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("");
     println!("{}", LICENCE_ITERTOOLS);
+    println!("");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("");
     println!("{}", LICENCE_THISERROR);
 }
@@ -40,7 +60,6 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>."#;
 
 pub(crate) const LICENCE_SPARSEPAINTER: &str = r#"Sparsepainter
-https://github.com/YaolingYang/SparsePainter
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
