@@ -94,7 +94,10 @@ impl HVec {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(version)]
+#[command(
+    version,
+    override_usage = "combine --chunkpathsfile <chunkpathsfile> --snpcountsfile <snpcountsfile> --maplengthsfile <maplengthsfile> [OPTIONS]"
+)]
 struct Args {
     /// A file containing the paths to the chunk files.
     #[arg(short, long, required_unless_present = "licences", default_value = "")]

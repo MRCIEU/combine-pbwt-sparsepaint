@@ -89,23 +89,25 @@ The rowsums file is a plain text file called `<PREFIX>.rowsums`. It contains the
 
 ```
 ❯ combine -h
-Usage: combine [OPTIONS] --chunkpathsfile <CHUNKPATHSFILE> --snpcountsfile <SNPCOUNTSFILE> --maplengthsfile <MAPLENGTHSFILE>
+Usage: combine --chunkpathsfile <chunkpathsfile> --snpcountsfile <snpcountsfile> --maplengthsfile <maplengthsfile> [OPTIONS]
 
 Options:
   -c, --chunkpathsfile <CHUNKPATHSFILE>
-          A file containing the paths to the chunk files
+          A file containing the paths to the chunk files [default: ""]
   -s, --snpcountsfile <SNPCOUNTSFILE>
-          A file containing the SNP counts for each chunk
+          A file containing the SNP counts for each chunk, in the same order as the chunk paths file [default: ""]
   -m, --maplengthsfile <MAPLENGTHSFILE>
-          A file containing the map lengths for each chunk
+          A file containing the map lengths for each chunk, in the same order as the chunk paths file [default: ""]
   -r, --restrictrows[=<RESTRICTROWS>]
           The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
   -w, --writerowsums
-          Write the row sums (prior to any dynamic filtering). If --restrictrows is in effect, this file will be written anyway
+          Write the row sums. If --restrictrows is in effect, this file will be written anyway
   -t, --threads <THREADS>
           The number of threads to use for writing [default: 8]
   -o, --out <OUT>
           The prefix for the output file(s) [default: combined]
+  -l, --licences
+          Print the licences and exit
   -h, --help
           Print help
   -V, --version
