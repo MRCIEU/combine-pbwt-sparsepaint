@@ -6,6 +6,9 @@ use std::io;
 use std::io::{BufRead, BufReader, BufWriter};
 use thiserror::Error;
 
+mod licences;
+use licences::print_licences;
+
 mod write;
 use write::parallel_read_write;
 
@@ -94,15 +97,15 @@ impl HVec {
 #[command(version)]
 struct Args {
     /// A file containing the paths to the chunk files.
-    #[arg(short, long, required = true)]
+    #[arg(short, long, required_unless_present = "licences", default_value = "")]
     chunkpathsfile: String,
 
     /// A file containing the SNP counts for each chunk, in the same order as the chunk paths file.
-    #[arg(short, long, required = true)]
+    #[arg(short, long, required_unless_present = "licences", default_value = "")]
     snpcountsfile: String,
 
     /// A file containing the map lengths for each chunk, in the same order as the chunk paths file.
-    #[arg(short, long, required = true)]
+    #[arg(short, long, required_unless_present = "licences", default_value = "")]
     maplengthsfile: String,
 
     /// The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
@@ -120,10 +123,19 @@ struct Args {
     /// The prefix for the output file(s).
     #[arg(short, long, required = false, default_value = "combined")]
     out: String,
+
+    /// Print the licences and exit.
+    #[arg(short, long, alias = "license", default_value_t = false)]
+    licences: bool,
 }
 
 fn main() {
     let args = Args::parse();
+
+    if args.licences {
+        print_licences();
+        std::process::exit(0);
+    }
 
     run(args).unwrap_or_else(|e| {
         eprintln!("{}", e);
