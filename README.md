@@ -16,6 +16,43 @@ Documentation for the original haplotype component calculation pipeline [can be 
 
 The program in this repository performs step 2.
 
+## Installation
+
+### Locally
+
+You will need to [install Rust](https://www.rust-lang.org/tools/install) first.
+
+Then you should be able to install combine-pbwt-sparsepaint by running:
+
+```
+cargo install --git https://github.com/mrcieu/combine-pbwt-sparsepaint
+```
+
+and the binary will be installed somewhere in your `$PATH`:
+
+```
+combine -h
+```
+
+or clone the repository and build it:
+
+```
+git clone https://github.com/mrcieu/combine-pbwt-sparsepaint
+cd combine-pbwt-sparsepaint
+cargo build --release
+```
+
+and the binary gets built in the repo's directory:
+
+```
+❯ ls target/release
+combine
+```
+
+### Docker
+
+There is a Dockerfile in this repository which you can either use to make a distroless image containing `combine` (and nothing else), or an image with an alpine linux base (comment out / uncomment the relevant sections).
+
 ## Usage
 
 ### Input
