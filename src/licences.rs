@@ -11,7 +11,7 @@ pub(crate) fn print_licences() {
     println!("");
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("");
-    println!("As well as the following software:");
+    println!("And makes use of the following software:");
     println!("");
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("");
