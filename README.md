@@ -65,13 +65,13 @@ Required:
 
 Optional:
 
-* `--restrictrows`: restrict the number of rows in the output (to `< 2^31` when provided with no argument). Specific values can be provided: `--restrictrows=N` restricts the number of rows to `N`. The equals sign `=` is required when using this flag with a value.
+* `--restrict`: restrict the number of rows in the output (to `< 2^31` when provided with no argument). Specific values can be provided: `--restrict=N` restricts the number of rows to `N`. The equals sign `=` is required when using this flag with a value.
 
-* `--writerowsums`: write the sum of the scaled values for each row in the sparse matrix (prior to any filtering because of `--restrictrows`) to a file. If you use `--restrictrows`, this file will be written by default.
+* `--writesums`: write the sum of the scaled values for each row in the sparse matrix (prior to any filtering because of `--restrict`) to a file. If you use `--restrict`, this file will be written by default.
 
 * `--threads`: number of threads to use for parallel processing of the output. Set to 8 by default. Must be `>=1`. The first part of the program (reading the data) is not parallelized, but the second part (writing the output) is parallelized, and speeds up with additional threads.
 
-* `--out`: prefix for the output files. By default, this is set to `combined`, and the main output file will be called `<PREFIX>.txt.gz`. The rowsums file will be called `<PREFIX>.rowsums`, if written.
+* `--out`: prefix for the output files. By default, this is set to `combined`, and the main output file will be called `<PREFIX>.txt.gz`. The sums file will be called `<PREFIX>.sums`, if written.
 
 ### Output
 
@@ -85,10 +85,10 @@ The main output is a gzip-compressed tab-separated text file with no header (`<P
 11    1       8.0
 ```
 
-The rowsums file is a plain text file called `<PREFIX>.rowsums`. It contains the sum of the values in the value column for each row index. E.g.:
+The rowsums file is a plain text file called `<PREFIX>.sums`. It contains the sum of the values in the value column for each index. E.g.:
 
 ```sh
-❯ head -n1 combined.rowsums 
+❯ head -n1 combined.sums 
 27.5
 ```
 
