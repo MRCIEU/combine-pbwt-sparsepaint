@@ -23,34 +23,11 @@ enum CombineError {
     #[error(transparent)]
     ParseFloatError(#[from] std::num::ParseFloatError),
     #[error(transparent)]
-    ChanSendRowLocationErr(#[from] crossbeam_channel::SendError<write::RowLocation>),
-    #[error(transparent)]
-    ChanSendWriteDataErr(#[from] crossbeam_channel::SendError<write::WriteData>),
-    #[error("lock poisoned")]
-    LockPoisoned,
-    #[error(transparent)]
     GZipError(#[from] gzp::GzpError),
-    #[error("thread panicked: {0}")]
-    ThreadPanic(String),
+    #[error(transparent)]
+    ThreadPoolBuildError(#[from] rayon::ThreadPoolBuildError),
     #[error("{0}")]
     Message(String),
-}
-
-impl<T> From<std::sync::PoisonError<T>> for CombineError {
-    fn from(_: std::sync::PoisonError<T>) -> Self {
-        CombineError::LockPoisoned
-    }
-}
-
-impl From<Box<dyn std::any::Any + Send + 'static>> for CombineError {
-    fn from(e: Box<dyn std::any::Any + Send + 'static>) -> Self {
-        let msg = e
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| e.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "unknown panic".to_string());
-        CombineError::ThreadPanic(msg)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,11 +90,11 @@ struct Args {
 
     /// The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
     #[arg(short, long, default_missing_value = "2147483648", num_args = 0..=1, require_equals = true)]
-    restrictrows: Option<usize>,
+    restrict: Option<usize>,
 
-    /// Write the row sums. If --restrictrows is in effect, this file will be written anyway.
+    /// Write the sums across the matrix before any filtering. If --restrict is in effect, this file will be written anyway.
     #[arg(short, long, required = false, default_value_t = false)]
-    writerowsums: bool,
+    writesums: bool,
 
     /// The number of threads to use for writing.
     #[arg(short, long, required = false, default_value_t = 8)]
@@ -153,10 +130,10 @@ fn run(mut args: Args) -> Result<()> {
         ));
     }
 
-    let nrows = args.restrictrows;
+    let nrows = args.restrict;
 
     if nrows.is_some() {
-        args.writerowsums = true;
+        args.writesums = true;
     }
 
     let chr_filenames = read_values_per_line::<String>(&args.chunkpathsfile)?;
@@ -188,9 +165,9 @@ fn run(mut args: Args) -> Result<()> {
     // -----------------------------------------------------------------------
     // Determine dynamic threshold.
     //
-    // If --restrictrows is set, and the number of entries surviving the static
-    // threshold is >= args.restrictrows, we must drop additional entries (the
-    // smallest ones) until fewer than args.restrictrows remain. We find the exact
+    // If --restrict is set, and the number of entries surviving the static
+    // threshold is >= args.restrict, we must drop additional entries (the
+    // smallest ones) until fewer than args.restrict remain. We find the exact
     // cut-off value using a linear-time selection algorithm, then keep only
     // entries strictly above it.
     //
@@ -209,16 +186,16 @@ fn run(mut args: Args) -> Result<()> {
     //
     // An entry is written iff:
     //   val >= 0.000005          (static threshold, always applied)
-    //   val > dynamic_threshold  (only active when total entries >= args.restrictrows)
+    //   val > dynamic_threshold  (only active when total entries >= args.restrict)
     // -----------------------------------------------------------------------
 
     let output_path = format!("{}.txt.gz", &args.out);
     let output_file = File::create(&output_path)?;
     let hap_writer = BufWriter::new(Box::new(output_file));
 
-    let rowsums_writer = if args.writerowsums {
+    let sums_writer = if args.writesums {
         Some(BufWriter::new(Box::new(File::create(format!(
-            "{}.rowsums",
+            "{}.sums",
             &args.out
         ))?)))
     } else {
@@ -226,15 +203,7 @@ fn run(mut args: Args) -> Result<()> {
     };
 
     eprintln!("Writing output matrix");
-    parallel_read_write(
-        args.threads,
-        cl,
-        hap_writer,
-        rowsums_writer,
-        dynamic_threshold,
-        args.writerowsums,
-    )?;
-
+    parallel_read_write(args.threads, cl, hap_writer, sums_writer, dynamic_threshold)?;
     Ok(())
 }
 
@@ -428,7 +397,7 @@ mod tests {
             "--chunkpathsfile", &testdata("chunklength.files.txt"),
             "--snpcountsfile", &testdata("nsnps.txt"),
             "--maplengthsfile", &testdata("map_lengths.txt"),
-            "--writerowsums",
+            "--writesums",
             "--out", &testdata("combined.r"),
         ]);
 
@@ -439,12 +408,12 @@ mod tests {
 
         assert_eq!(actual, expected);
 
-        let actual_rowsums = file_2_lines(&std::fs::read(testdata("combined.r.rowsums")).unwrap(), false);
+        let actual_sums = file_2_lines(&std::fs::read(testdata("combined.r.sums")).unwrap(), false);
 
-        assert_eq!(get_nrows(actual), actual_rowsums.len());
+        assert_eq!(get_nrows(actual), actual_sums.len());
 
         std::fs::remove_file(testdata("combined.r.txt.gz")).unwrap();
-        std::fs::remove_file(testdata("combined.r.rowsums")).unwrap();
+        std::fs::remove_file(testdata("combined.r.sums")).unwrap();
     }
 
     #[test]
@@ -455,7 +424,7 @@ mod tests {
             "--chunkpathsfile", &testdata("chunklength.files.txt"),
             "--snpcountsfile", &testdata("nsnps.txt"),
             "--maplengthsfile", &testdata("map_lengths.txt"),
-            "--restrictrows=10000",
+            "--restrict=10000",
             "--out", &testdata("combined.r.10000"),
         ]);
 
@@ -464,12 +433,12 @@ mod tests {
         let actual = file_2_lines(&std::fs::read(testdata("combined.r.10000.txt.gz")).unwrap(), true);
         assert!(actual.len() <= 10000);
 
-        let actual_rowsums = file_2_lines(&std::fs::read(testdata("combined.r.10000.rowsums")).unwrap(), false);
+        let actual_sums = file_2_lines(&std::fs::read(testdata("combined.r.10000.sums")).unwrap(), false);
 
-        assert_eq!(get_nrows(actual), actual_rowsums.len());
+        assert_eq!(get_nrows(actual), actual_sums.len());
 
         std::fs::remove_file(testdata("combined.r.10000.txt.gz")).unwrap();
-        std::fs::remove_file(testdata("combined.r.10000.rowsums")).unwrap();
+        std::fs::remove_file(testdata("combined.r.10000.sums")).unwrap();
     }
 
     #[test]
@@ -480,7 +449,7 @@ mod tests {
             "--chunkpathsfile", &testdata("chunklength.files.txt"),
             "--snpcountsfile", &testdata("nsnps.txt"),
             "--maplengthsfile", &testdata("map_lengths.txt"),
-            "--writerowsums",
+            "--writesums",
             "--out", &testdata("combined.cpp"),
         ]);
 
@@ -497,18 +466,18 @@ mod tests {
 
         assert_eq!(actual_values_rounded, expected_values_rounded);
 
-        let actual_rowsums = file_2_lines(&std::fs::read(testdata("combined.cpp.rowsums")).unwrap(), false);
-        let expected_rowsums = file_2_lines(&std::fs::read(testdata("expected.cpp.sorted.rowsums")).unwrap(), false);
+        let actual_sums = file_2_lines(&std::fs::read(testdata("combined.cpp.sums")).unwrap(), false);
+        let expected_sums = file_2_lines(&std::fs::read(testdata("expected.cpp.sorted.sums")).unwrap(), false);
 
-        assert_eq!(actual_rowsums.len(), expected_rowsums.len());
+        assert_eq!(actual_sums.len(), expected_sums.len());
 
         // there are rounding differences due to floating point precision between the rust implementation and the cpp implementation
-        let actual_rowsums_rounded = actual_rowsums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-        let expected_rowsums_rounded = expected_rowsums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
+        let actual_sums_rounded = actual_sums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
+        let expected_sums_rounded = expected_sums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
 
-        assert_eq!(actual_rowsums_rounded, expected_rowsums_rounded);
+        assert_eq!(actual_sums_rounded, expected_sums_rounded);
 
         std::fs::remove_file(testdata("combined.cpp.txt.gz")).unwrap();
-        std::fs::remove_file(testdata("combined.cpp.rowsums")).unwrap();
+        std::fs::remove_file(testdata("combined.cpp.sums")).unwrap();
     }
 }

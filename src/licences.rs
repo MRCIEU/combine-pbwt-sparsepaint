@@ -1,44 +1,44 @@
 pub(crate) fn print_licences() {
     println!("{}", LICENCE);
-    println!("");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
+    println!();
     println!(
-        "combine is derived from some of the code in https://github.com/YaolingYang/SparsePainter,\nwhich is licensed under GNU GPL-3.0:"
+        "combine is derived from https://github.com/YaolingYang/SparsePainter,\nwhich is licensed under GNU GPL-3.0:"
     );
-    println!("");
+    println!();
     println!("{}", LICENCE_SPARSEPAINTER);
-    println!("");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
-    println!("As well as the following software:");
-    println!("");
+    println!();
+    println!("And makes use of the following software:");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
+    println!();
     println!("{}", LICENCE_CLAP);
-    println!("");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
+    println!();
     println!("{}", LICENCE_CROSSBEAM_CHANNEL);
-    println!("");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
+    println!();
     println!("{}", LICENCE_CROSSBEAM_UTILS);
-    println!("");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
+    println!();
     println!("{}", LICENCE_FLATE2);
-    println!("");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
+    println!();
     println!("{}", LICENCE_GZP);
-    println!("");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
+    println!();
     println!("{}", LICENCE_ITERTOOLS);
-    println!("");
+    println!();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("");
+    println!();
     println!("{}", LICENCE_THISERROR);
 }
 
