@@ -143,8 +143,10 @@ Options:
           The number of threads to use for writing [default: 8]
   -o, --out <OUT>
           The prefix for the output file(s) [default: combined]
-  -l, --licences
-          Print the licences and exit
+  -l
+          Print a summary of licence information
+      --licences
+          Print full licence information, including all third-party notices
   -v, --version
           Print version
   -h, --help

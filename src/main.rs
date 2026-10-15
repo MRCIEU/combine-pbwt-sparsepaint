@@ -6,13 +6,20 @@ use std::io;
 use std::io::{BufRead, BufReader, BufWriter};
 use thiserror::Error;
 
-mod licences;
-use licences::print_licences;
-
 mod write;
 use write::parallel_read_write;
 
 type Result<T> = std::result::Result<T, CombineError>;
+
+/// The NOTICE file: this program's licence, and the notices of its third-party dependencies
+const NOTICE: &str = include_str!("../NOTICE");
+
+/// The opening statement of NOTICE, i.e. everything before the first third-party notice
+fn get_notice_summary() -> &'static str {
+    NOTICE
+        .split_once("\n---")
+        .map_or(NOTICE, |(summary, _)| summary)
+}
 
 #[derive(Debug, Error)]
 enum CombineError {
@@ -78,15 +85,15 @@ impl HVec {
 )]
 struct Args {
     /// A file containing the paths to the chunk files.
-    #[arg(short, long, required_unless_present = "licences", default_value = "")]
+    #[arg(short, long, required_unless_present_any = ["licences", "licences_summary"], default_value = "")]
     chunkpathsfile: String,
 
     /// A file containing the SNP counts for each chunk, in the same order as the chunk paths file.
-    #[arg(short, long, required_unless_present = "licences", default_value = "")]
+    #[arg(short, long, required_unless_present_any = ["licences", "licences_summary"], default_value = "")]
     snpcountsfile: String,
 
     /// A file containing the map lengths for each chunk, in the same order as the chunk paths file.
-    #[arg(short, long, required_unless_present = "licences", default_value = "")]
+    #[arg(short, long, required_unless_present_any = ["licences", "licences_summary"], default_value = "")]
     maplengthsfile: String,
 
     /// The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
@@ -105,8 +112,12 @@ struct Args {
     #[arg(short, long, required = false, default_value = "combined")]
     out: String,
 
-    /// Print the licences and exit.
-    #[arg(short, long, alias = "license", default_value_t = false)]
+    /// Print a summary of licence information
+    #[arg(short = 'l', default_value_t = false)]
+    licences_summary: bool,
+
+    /// Print full licence information, including all third-party notices
+    #[arg(long, aliases = ["licenses", "license"], default_value_t = false)]
     licences: bool,
 
     /// Print version
@@ -118,7 +129,15 @@ fn main() {
     let args = Args::parse();
 
     if args.licences {
-        print_licences();
+        print!("{NOTICE}");
+        std::process::exit(0);
+    }
+
+    if args.licences_summary {
+        println!("{}", get_notice_summary());
+        println!(
+            "Use \"combine --licences\" to print the full text, including all third-party notices."
+        );
         std::process::exit(0);
     }
 
@@ -336,6 +355,14 @@ mod tests {
     fn verify_cli() {
         use clap::CommandFactory;
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn test_notice_summary_stops_before_first_third_party_notice() {
+        let summary = get_notice_summary();
+        assert!(summary.starts_with("combine is licensed under the GNU General Public License"));
+        assert!(!summary.contains("---"));
+        assert!(summary.len() < NOTICE.len());
     }
 
     fn testdata(filename: &str) -> String {
