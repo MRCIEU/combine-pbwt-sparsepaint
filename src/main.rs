@@ -73,6 +73,7 @@ impl HVec {
 #[derive(Parser, Debug)]
 #[command(
     version,
+    disable_version_flag = true,
     override_usage = "combine --chunkpathsfile <chunkpathsfile> --snpcountsfile <snpcountsfile> --maplengthsfile <maplengthsfile> [OPTIONS]"
 )]
 struct Args {
@@ -107,6 +108,10 @@ struct Args {
     /// Print the licences and exit.
     #[arg(short, long, alias = "license", default_value_t = false)]
     licences: bool,
+
+    /// Print version
+    #[arg(short = 'v', long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
 }
 
 fn main() {

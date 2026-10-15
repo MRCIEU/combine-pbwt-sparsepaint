@@ -135,18 +135,18 @@ Options:
           A file containing the SNP counts for each chunk, in the same order as the chunk paths file [default: ""]
   -m, --maplengthsfile <MAPLENGTHSFILE>
           A file containing the map lengths for each chunk, in the same order as the chunk paths file [default: ""]
-  -r, --restrictrows[=<RESTRICTROWS>]
+  -r, --restrict[=<RESTRICT>]
           The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
-  -w, --writerowsums
-          Write the row sums. If --restrictrows is in effect, this file will be written anyway
+  -w, --writesums
+          Write the sums across the matrix before any filtering. If --restrict is in effect, this file will be written anyway
   -t, --threads <THREADS>
           The number of threads to use for writing [default: 8]
   -o, --out <OUT>
           The prefix for the output file(s) [default: combined]
   -l, --licences
           Print the licences and exit
+  -v, --version
+          Print version
   -h, --help
           Print help
-  -V, --version
-          Print version
 ```
