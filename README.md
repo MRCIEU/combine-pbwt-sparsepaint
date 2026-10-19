@@ -31,7 +31,7 @@ cargo install --git https://github.com/mrcieu/combine-pbwt-sparsepaint
 and the binary will be installed locally (in `$HOME/.cargo/bin` unless you have specified otherwise. Run `cargo help install` if you need to work out where):
 
 ```
-~/.cargo/bin/gu -h
+~/.cargo/bin/combine -h
 ```
 
 or clone the repository and build it:
