@@ -1,4 +1,1 @@
 /target
-
-# Left behind by integration tests that fail before cleaning up
-/testdata/combined*
