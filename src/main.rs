@@ -107,7 +107,7 @@ struct Args {
     #[arg(short, long, default_missing_value = R_MAX_ENTRIES, num_args = 0..=1, require_equals = true)]
     restrict: Option<usize>,
 
-    /// Write the sums across the matrix before any filtering. If --restrict is in effect, this file will be written anyway.
+    /// Write the sum of each row (index1) to <OUT>.sums, as "index1 sum", counting all values >= 0.000005 including any dropped by --restrict. Always written if --restrict is used.
     #[arg(short, long, required = false, default_value_t = false)]
     writesums: bool,
 
@@ -403,6 +403,37 @@ mod tests {
             .count()
     }
 
+    /// Number of individuals (rows) in testdata
+    const N_INDS: usize = 3202;
+
+    /// Parse "index sum" lines from a .sums file.
+    fn parse_sums(lines: &[String]) -> Vec<(usize, f64)> {
+        lines
+            .iter()
+            .map(|l| {
+                let (i, s) = l.split_once(' ').unwrap();
+                (i.parse().unwrap(), s.parse().unwrap())
+            })
+            .collect()
+    }
+
+    /// Check that a .sums file has one line for every row in testdata, in order, and that the sums
+    /// match those calculated from the C++ implementation's output (up to floating point error).
+    fn check_sums(lines: &[String]) {
+        let sums = parse_sums(lines);
+        let expected = file_2_lines(
+            &std::fs::read(testdata("expected.cpp.sorted.sums")).unwrap(),
+            false,
+        );
+        assert_eq!(sums.len(), N_INDS);
+        assert_eq!(expected.len(), N_INDS);
+        for (k, ((i, s), e)) in sums.iter().zip(&expected).enumerate() {
+            assert_eq!(*i, k + 1);
+            let e: f64 = e.parse().unwrap();
+            assert!((s - e).abs() < 1e-3, "row {i}: sum {s}, expected {e}");
+        }
+    }
+
     #[test]
     #[rustfmt::skip]
     fn test_combine_matches_expected() {
@@ -446,6 +477,7 @@ mod tests {
         let actual_sums = file_2_lines(&std::fs::read(testdata("combined.r.sums")).unwrap(), false);
 
         assert_eq!(get_nrows(actual), actual_sums.len());
+        check_sums(&actual_sums);
 
         std::fs::remove_file(testdata("combined.r.txt.gz")).unwrap();
         std::fs::remove_file(testdata("combined.r.sums")).unwrap();
@@ -470,7 +502,9 @@ mod tests {
 
         let actual_sums = file_2_lines(&std::fs::read(testdata("combined.r.10000.sums")).unwrap(), false);
 
-        assert_eq!(get_nrows(actual), actual_sums.len());
+        // rows with no entries left after --restrict are still in the sums file, with their full sums
+        assert!(get_nrows(actual) < N_INDS);
+        check_sums(&actual_sums);
 
         std::fs::remove_file(testdata("combined.r.10000.txt.gz")).unwrap();
         std::fs::remove_file(testdata("combined.r.10000.sums")).unwrap();
@@ -521,7 +555,7 @@ mod tests {
             true,
         );
         assert!(actual.len() < N_EXPECTED_ENTRIES);
-        assert_eq!(get_nrows(actual.clone()), actual_sums.len());
+        check_sums(&actual_sums);
 
         let value = |l: &String| l.split_whitespace().nth(2).unwrap().parse::<f64>().unwrap();
         let min_kept = actual.iter().map(value).fold(f64::INFINITY, f64::min);
@@ -535,10 +569,10 @@ mod tests {
     }
 
     #[test]
-    fn test_restrict_zero_writes_nothing() {
+    fn test_restrict_zero_writes_no_entries_but_all_sums() {
         let (actual, actual_sums) = run_restricted(0, "combined.r.zero");
         assert!(actual.is_empty());
-        assert!(actual_sums.is_empty());
+        check_sums(&actual_sums);
     }
 
     #[test]
@@ -560,22 +594,20 @@ mod tests {
 
         assert_eq!(actual.len(), expected.len());
 
-        // there are rounding differences due to floating point precision between the rust implementation and the cpp implementation
-        let actual_values_rounded = actual.iter().map(|l| l.split_whitespace().next().unwrap().parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-        let expected_values_rounded = expected.iter().map(|l| l.split_whitespace().next().unwrap().parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-
-        assert_eq!(actual_values_rounded, expected_values_rounded);
+        // there are small differences due to floating point precision between the rust implementation and the cpp implementation
+        let split = |l: &String| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            ((f[0].parse::<usize>().unwrap(), f[1].parse::<usize>().unwrap()), f[2].parse::<f64>().unwrap())
+        };
+        for (a, e) in actual.iter().zip(&expected) {
+            let ((ai, aj), av) = split(a);
+            let ((ei, ej), ev) = split(e);
+            assert_eq!((ai, aj), (ei, ej));
+            assert!((av - ev).abs() < 1e-3, "{a} vs {e}");
+        }
 
         let actual_sums = file_2_lines(&std::fs::read(testdata("combined.cpp.sums")).unwrap(), false);
-        let expected_sums = file_2_lines(&std::fs::read(testdata("expected.cpp.sorted.sums")).unwrap(), false);
-
-        assert_eq!(actual_sums.len(), expected_sums.len());
-
-        // there are rounding differences due to floating point precision between the rust implementation and the cpp implementation
-        let actual_sums_rounded = actual_sums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-        let expected_sums_rounded = expected_sums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-
-        assert_eq!(actual_sums_rounded, expected_sums_rounded);
+        check_sums(&actual_sums);
 
         std::fs::remove_file(testdata("combined.cpp.txt.gz")).unwrap();
         std::fs::remove_file(testdata("combined.cpp.sums")).unwrap();
