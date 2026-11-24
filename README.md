@@ -65,7 +65,7 @@ Required:
 
 Optional:
 
-* `--restrict`: restrict the number of rows in the output (to `< 2^31` when provided with no argument). Specific values can be provided: `--restrict=N` restricts the number of rows to `N`. The equals sign `=` is required when using this flag with a value.
+* `--restrict`: restrict the number of entries (lines) in the output to at most `2^31-1` when provided with no argument, by dropping the entries with the smallest values. This is the largest number of non-zero entries a sparse matrix can hold in R's [Matrix](https://cran.r-project.org/package=Matrix) package (and the maximum number of rows in a `data.table`), so the output can be loaded with e.g. `data.table::fread()` and `Matrix::sparseMatrix()`. Specific values can be provided: `--restrict=N` writes at most `N` entries. If several entries tie at the cut-off value, they are all dropped, so slightly fewer than `N` entries may be written. The equals sign `=` is required when using this flag with a value.
 
 * `--writesums`: write the sum of the scaled values for each row in the sparse matrix (prior to any filtering because of `--restrict`) to a file. If you use `--restrict`, this file will be written by default.
 
@@ -75,21 +75,21 @@ Optional:
 
 ### Output
 
-The main output is a gzip-compressed tab-separated text file with no header (`<PREFIX>.txt.gz`). It consists of three columns: `index1`, `index2`, and `value`, where `index1` is the (1-based) row index of the first sample in the original (vcf) file provided to `pbwt`, and `index2` is the (1-based) row index of the second sample. The `value` column contains the expected haplotype length, in map units, inherited between this pair of samples. E.g.:
+The main output is a gzip-compressed, space-separated text file with no header (`<PREFIX>.txt.gz`). It consists of three columns: `index1`, `index2`, and `value`, where `index1` is the (1-based) row index of the first sample in the original (vcf) file provided to `pbwt`, and `index2` is the (1-based) row index of the second sample. The `value` column contains the expected haplotype length, in map units, inherited between this pair of samples. E.g.:
 
 ```sh
-❯ zcat combined.txt.gz | head -n3
-1     11      10.5
-1     12      5.5
-1     540     11.5
-11    1       8.0
+❯ zcat combined.txt.gz | head -n4
+1 11 10.50000
+1 12 5.50000
+1 540 11.50000
+11 1 8.00000
 ```
 
 The rowsums file is a plain text file called `<PREFIX>.sums`. It contains the sum of the values in the value column for each index. E.g.:
 
 ```sh
 ❯ head -n1 combined.sums 
-27.5
+27.50000
 ```
 
 ### Example command line use
@@ -136,7 +136,7 @@ Options:
   -m, --maplengthsfile <MAPLENGTHSFILE>
           A file containing the map lengths for each chunk, in the same order as the chunk paths file [default: ""]
   -r, --restrict[=<RESTRICT>]
-          The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
+          The maximum number of entries (lines) to write to the output file. The smallest values are dropped first [Default with flag but no value: 2^31-1, the most R's Matrix package can hold]
   -w, --writesums
           Write the sums across the matrix before any filtering. If --restrict is in effect, this file will be written anyway
   -t, --threads <THREADS>

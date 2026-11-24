@@ -2,7 +2,7 @@ use gzp::{ZBuilder, deflate::Gzip};
 use rayon::prelude::*;
 use std::io::Write;
 
-use crate::{HMat, HVec, Result};
+use crate::{HMat, HVec, Result, STATIC_THRESHOLD};
 
 // The number of rows formatted in parallel per formatting thread before being written out.
 // This bounds the amount of formatted (uncompressed) output held in memory at once.
@@ -84,7 +84,7 @@ fn format_row(key: usize, row: &HVec, dynamic_threshold: f64) -> Result<(Vec<u8>
     let mut rowsum = 0.0;
 
     for (j, &val) in &row.v {
-        if val >= 0.000005 {
+        if val >= STATIC_THRESHOLD {
             rowsum += val;
             if val > dynamic_threshold {
                 writeln!(buffer, "{} {} {:.5}", key + 1, j + 1, val)?;

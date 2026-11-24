@@ -11,6 +11,13 @@ use write::parallel_read_write;
 
 type Result<T> = std::result::Result<T, CombineError>;
 
+/// Entries below this value are never written to the output, and are not counted in row sums.
+pub(crate) const STATIC_THRESHOLD: f64 = 0.000005;
+
+/// Default for `--restrict` with no value: the largest number of non-zero entries a sparse matrix
+/// can hold in R's Matrix package (.Machine$integer.max, 2^31-1).
+const R_MAX_ENTRIES: &str = "2147483647";
+
 /// The NOTICE file: this program's licence, and the notices of its third-party dependencies
 const NOTICE: &str = include_str!("../NOTICE");
 
@@ -96,8 +103,8 @@ struct Args {
     #[arg(short, long, required_unless_present_any = ["licences", "licences_summary"], default_value = "")]
     maplengthsfile: String,
 
-    /// The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
-    #[arg(short, long, default_missing_value = "2147483648", num_args = 0..=1, require_equals = true)]
+    /// The maximum number of entries (lines) to write to the output file. The smallest values are dropped first [Default with flag but no value: 2^31-1, the most R's Matrix package can hold]
+    #[arg(short, long, default_missing_value = R_MAX_ENTRIES, num_args = 0..=1, require_equals = true)]
     restrict: Option<usize>,
 
     /// Write the sums across the matrix before any filtering. If --restrict is in effect, this file will be written anyway.
@@ -189,14 +196,10 @@ fn run(mut args: Args) -> Result<()> {
     // -----------------------------------------------------------------------
     // Determine dynamic threshold.
     //
-    // If --restrict is set, and the number of entries surviving the static
-    // threshold is >= args.restrict, we must drop additional entries (the
-    // smallest ones) until fewer than args.restrict remain. We find the exact
-    // cut-off value using a linear-time selection algorithm, then keep only
-    // entries strictly above it.
-    //
-    // Note: if there are ties at the threshold value, more than the minimum
-    // number of entries may be dropped, but the count is guaranteed < args.restrictrows.
+    // If --restrict=N is set and more than N entries survive the static
+    // threshold, find a cut-off so that only entries strictly above it are
+    // written, leaving at most N entries. If there are ties at the cut-off,
+    // fewer than N entries may be written.
     // -----------------------------------------------------------------------
     let dynamic_threshold: f64 = if let Some(n) = nrows {
         get_dynamic_threshold(&cl, n)
@@ -206,11 +209,11 @@ fn run(mut args: Args) -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Pass 2: write the output matrix, applying both thresholds.
+    // Write the output matrix, applying both thresholds.
     //
     // An entry is written iff:
-    //   val >= 0.000005          (static threshold, always applied)
-    //   val > dynamic_threshold  (only active when total entries >= args.restrict)
+    //   val >= STATIC_THRESHOLD  (always applied)
+    //   val > dynamic_threshold  (-inf unless --restrict needs to drop entries)
     // -----------------------------------------------------------------------
 
     let output_path = format!("{}.txt.gz", &args.out);
@@ -231,38 +234,39 @@ fn run(mut args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Returns threshold below which to exclude values from the output if there are more
-/// rows in the input than are permitted
-fn get_dynamic_threshold(cl: &HMat, nrows: usize) -> f64 {
+/// Returns the value at or below which entries are excluded from the output, so that at most
+/// `max_entries` entries are written. Returns -infinity if no entries need to be excluded.
+fn get_dynamic_threshold(cl: &HMat, max_entries: usize) -> f64 {
     eprintln!("Determining dynamic threshold");
+    // Only count entries that will survive the static threshold. This also excludes NaN.
     let mut all_values: Vec<f64> =
         cl.m.values()
             .flat_map(|row| row.v.values())
             .copied()
+            .filter(|&v| v >= STATIC_THRESHOLD)
             .collect();
 
     let total_length = all_values.len();
 
-    let dynamic_threshold: f64 = if all_values.len() >= nrows {
-        let n_to_drop = total_length - nrows;
-        // select_nth_unstable_by(k) rearranges all_values so that the element
-        // at sorted position k is in place. Elements before it are <= it and
-        // elements after are >= it. We then keep entries strictly > threshold,
-        // guaranteeing at most MAX_ENTRIES entries in the output.
-        // f64 doesn't implement Ord (due to NaN), so we use partial_cmp.
-        // The unwrap is safe: all values here are finite (>= 0.000005).
-        let threshold = all_values
-            .select_nth_unstable_by(n_to_drop - 1, |a, b| a.partial_cmp(b).unwrap())
+    let dynamic_threshold = if total_length > max_entries {
+        let n_to_drop = total_length - max_entries;
+        // After select_nth_unstable_by(k), the element at k is the one that would be at sorted
+        // position k. Keeping only entries > it drops at least the n_to_drop smallest entries.
+        let threshold = *all_values
+            .select_nth_unstable_by(n_to_drop - 1, |a, b| a.total_cmp(b))
             .1;
         eprintln!(
-            "Note: {} entries survive the static threshold (>= 2^31); \
-             applying dynamic threshold {:.6} to drop at least {} entries.",
-            total_length, threshold, n_to_drop
+            "Note: {} entries survive the static threshold, which is more than the {} allowed by \
+             --restrict; dropping entries <= {:.6} (at least {} entries).",
+            total_length, max_entries, threshold, n_to_drop
         );
-        *threshold
+        threshold
     } else {
-        // No dynamic exclusion needed; use -infinity so the condition
-        // `val > dynamic_threshold` is always satisfied for finite values.
+        eprintln!(
+            "{} entries survive the static threshold, no more than the {} allowed by --restrict; \
+             no dynamic threshold needed.",
+            total_length, max_entries
+        );
         f64::NEG_INFINITY
     };
 
@@ -390,7 +394,6 @@ mod tests {
         data.iter()
             .map(|s| {
                 s.split_ascii_whitespace()
-                    .into_iter()
                     .next()
                     .unwrap()
                     .parse::<usize>()
@@ -471,6 +474,71 @@ mod tests {
 
         std::fs::remove_file(testdata("combined.r.10000.txt.gz")).unwrap();
         std::fs::remove_file(testdata("combined.r.10000.sums")).unwrap();
+    }
+
+    /// Number of entries in testdata/expected.rust.txt.gz
+    const N_EXPECTED_ENTRIES: usize = 1929576;
+
+    fn run_restricted(restrict: usize, prefix: &str) -> (Vec<String>, Vec<String>) {
+        let restrict_arg = format!("--restrict={restrict}");
+        let args = Args::parse_from([
+            "combine",
+            "--chunkpathsfile",
+            &testdata("chunklength.files.txt"),
+            "--snpcountsfile",
+            &testdata("nsnps.txt"),
+            "--maplengthsfile",
+            &testdata("map_lengths.txt"),
+            &restrict_arg,
+            "--out",
+            &testdata(prefix),
+        ]);
+        run(args).unwrap();
+        let out = testdata(&format!("{prefix}.txt.gz"));
+        let sums = testdata(&format!("{prefix}.sums"));
+        let actual = file_2_lines(&std::fs::read(&out).unwrap(), true);
+        let actual_sums = file_2_lines(&std::fs::read(&sums).unwrap(), false);
+        std::fs::remove_file(out).unwrap();
+        std::fs::remove_file(sums).unwrap();
+        (actual, actual_sums)
+    }
+
+    #[test]
+    fn test_restrict_equal_to_entry_count_keeps_everything() {
+        let (actual, _) = run_restricted(N_EXPECTED_ENTRIES, "combined.r.exact");
+        let expected = file_2_lines(
+            &std::fs::read(testdata("expected.rust.txt.gz")).unwrap(),
+            true,
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_restrict_one_below_entry_count_drops_smallest() {
+        let (actual, actual_sums) = run_restricted(N_EXPECTED_ENTRIES - 1, "combined.r.minus1");
+        let expected = file_2_lines(
+            &std::fs::read(testdata("expected.rust.txt.gz")).unwrap(),
+            true,
+        );
+        assert!(actual.len() < N_EXPECTED_ENTRIES);
+        assert_eq!(get_nrows(actual.clone()), actual_sums.len());
+
+        let value = |l: &String| l.split_whitespace().nth(2).unwrap().parse::<f64>().unwrap();
+        let min_kept = actual.iter().map(value).fold(f64::INFINITY, f64::min);
+        let kept: std::collections::HashSet<&String> = actual.iter().collect();
+        let max_expected_dropped = expected
+            .iter()
+            .filter(|l| !kept.contains(l))
+            .map(value)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(max_expected_dropped <= min_kept);
+    }
+
+    #[test]
+    fn test_restrict_zero_writes_nothing() {
+        let (actual, actual_sums) = run_restricted(0, "combined.r.zero");
+        assert!(actual.is_empty());
+        assert!(actual_sums.is_empty());
     }
 
     #[test]
