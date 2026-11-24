@@ -1,0 +1,27 @@
+# Licences acceptable for dependencies of combine. Where a crate offers a
+# choice (e.g. "MIT OR Apache-2.0"), the licence listed first here is used.
+accepted = [
+    "MIT",
+    "BSL-1.0",
+    "Apache-2.0",
+    "Zlib",
+    "Unicode-3.0",
+]
+
+# Platforms combine is built for (the Docker image uses musl), so that
+# platform-specific dependencies for other targets (e.g. Windows) are left out
+targets = [
+    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# combine itself is GPL-3.0-only; only accept that licence for combine, so
+# that a GPL dependency is still flagged
+[combine]
+accepted = ["GPL-3.0-only"]
