@@ -2,7 +2,7 @@ use gzp::{ZBuilder, deflate::Gzip};
 use rayon::prelude::*;
 use std::io::Write;
 
-use crate::{HMat, HVec, Result};
+use crate::{HMat, HVec, Result, STATIC_THRESHOLD};
 
 // The number of rows formatted in parallel per formatting thread before being written out.
 // This bounds the amount of formatted (uncompressed) output held in memory at once.
@@ -60,31 +60,30 @@ pub(crate) fn parallel_read_write<BW: Write + Send + 'static>(
     Ok(())
 }
 
-// Writes formatted rows (in order) to the gzip writer, and the sums of non-empty rows to the
-// rowsum writer.
+// Writes formatted rows (in order) to the gzip writer, and "index sum" for every row to the
+// rowsum writer, including rows with no entries written because of --restrict.
 fn write_rows<W: Write>(
-    rows: &[(Vec<u8>, f64)],
+    rows: &[(usize, Vec<u8>, f64)],
     parz: &mut impl Write,
     rowsum_writer: &mut Option<W>,
 ) -> Result<()> {
-    for (data, rowsum) in rows {
+    for (key, data, rowsum) in rows {
         parz.write_all(data)?;
-        if let Some(rowsum_writer) = rowsum_writer
-            && !data.is_empty()
-        {
-            writeln!(rowsum_writer, "{:.5}", rowsum)?;
+        if let Some(rowsum_writer) = rowsum_writer {
+            writeln!(rowsum_writer, "{} {:.5}", key + 1, rowsum)?;
         }
     }
     Ok(())
 }
 
-// Formats one row of the sparse matrix for writing, and computes its sum.
-fn format_row(key: usize, row: &HVec, dynamic_threshold: f64) -> Result<(Vec<u8>, f64)> {
+// Formats one row of the sparse matrix for writing, and computes its sum over all values that pass
+// the static threshold (whether or not they pass the dynamic threshold).
+fn format_row(key: usize, row: &HVec, dynamic_threshold: f64) -> Result<(usize, Vec<u8>, f64)> {
     let mut buffer = Vec::new();
     let mut rowsum = 0.0;
 
     for (j, &val) in &row.v {
-        if val >= 0.000005 {
+        if val >= STATIC_THRESHOLD {
             rowsum += val;
             if val > dynamic_threshold {
                 writeln!(buffer, "{} {} {:.5}", key + 1, j + 1, val)?;
@@ -92,5 +91,5 @@ fn format_row(key: usize, row: &HVec, dynamic_threshold: f64) -> Result<(Vec<u8>
         }
     }
 
-    Ok((buffer, rowsum))
+    Ok((key, buffer, rowsum))
 }

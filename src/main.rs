@@ -3,13 +3,20 @@ use flate2::read::GzDecoder;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
-use std::io::{BufRead, BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use thiserror::Error;
 
 mod write;
 use write::parallel_read_write;
 
 type Result<T> = std::result::Result<T, CombineError>;
+
+/// Entries below this value are never written to the output, and are not counted in row sums.
+pub(crate) const STATIC_THRESHOLD: f64 = 0.000005;
+
+/// Default for `--restrict` with no value: the largest number of non-zero entries a sparse matrix
+/// can hold in R's Matrix package (.Machine$integer.max, 2^31-1).
+const R_MAX_ENTRIES: &str = "2147483647";
 
 /// The NOTICE file: this program's licence, and the notices of its third-party dependencies
 const NOTICE: &str = include_str!("../NOTICE");
@@ -96,11 +103,11 @@ struct Args {
     #[arg(short, long, required_unless_present_any = ["licences", "licences_summary"], default_value = "")]
     maplengthsfile: String,
 
-    /// The maximum number of rows to write to the output file [Default with flag but no value: 2^31-1]
-    #[arg(short, long, default_missing_value = "2147483648", num_args = 0..=1, require_equals = true)]
+    /// The maximum number of entries (lines) to write to the output file. The smallest values are dropped first [Default with flag but no value: 2^31-1, the most R's Matrix package can hold]
+    #[arg(short, long, default_missing_value = R_MAX_ENTRIES, num_args = 0..=1, require_equals = true)]
     restrict: Option<usize>,
 
-    /// Write the sums across the matrix before any filtering. If --restrict is in effect, this file will be written anyway.
+    /// Write the sum of each row (index1) to <OUT>.sums, as "index1 sum", counting all values >= 0.000005 including any dropped by --restrict. Always written if --restrict is used.
     #[arg(short, long, required = false, default_value_t = false)]
     writesums: bool,
 
@@ -147,7 +154,27 @@ fn main() {
     });
 }
 
-fn run(mut args: Args) -> Result<()> {
+fn run(args: Args) -> Result<()> {
+    let out = args.out.clone();
+    combine(args, |writesums| {
+        let hap_writer = BufWriter::new(File::create(format!("{out}.txt.gz"))?);
+        let sums_writer = if writesums {
+            Some(BufWriter::new(File::create(format!("{out}.sums"))?))
+        } else {
+            None
+        };
+        Ok((hap_writer, sums_writer))
+    })
+}
+
+/// Does all the work of `run`, except creating the output writers. Once the input has been loaded,
+/// `open_outputs` is called with whether the sums file is wanted, and returns the writers for the
+/// matrix and (if wanted) the sums. Tests use this to write to memory instead of files.
+fn combine<W, F>(mut args: Args, open_outputs: F) -> Result<()>
+where
+    W: Write + Send + 'static,
+    F: FnOnce(bool) -> Result<(W, Option<W>)>,
+{
     if args.threads < 1 {
         return Err(CombineError::Message(
             "invalid value for --threads <THREADS>: must be at least 1".to_string(),
@@ -189,14 +216,10 @@ fn run(mut args: Args) -> Result<()> {
     // -----------------------------------------------------------------------
     // Determine dynamic threshold.
     //
-    // If --restrict is set, and the number of entries surviving the static
-    // threshold is >= args.restrict, we must drop additional entries (the
-    // smallest ones) until fewer than args.restrict remain. We find the exact
-    // cut-off value using a linear-time selection algorithm, then keep only
-    // entries strictly above it.
-    //
-    // Note: if there are ties at the threshold value, more than the minimum
-    // number of entries may be dropped, but the count is guaranteed < args.restrictrows.
+    // If --restrict=N is set and more than N entries survive the static
+    // threshold, find a cut-off so that only entries strictly above it are
+    // written, leaving at most N entries. If there are ties at the cut-off,
+    // fewer than N entries may be written.
     // -----------------------------------------------------------------------
     let dynamic_threshold: f64 = if let Some(n) = nrows {
         get_dynamic_threshold(&cl, n)
@@ -206,63 +229,53 @@ fn run(mut args: Args) -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Pass 2: write the output matrix, applying both thresholds.
+    // Write the output matrix, applying both thresholds.
     //
     // An entry is written iff:
-    //   val >= 0.000005          (static threshold, always applied)
-    //   val > dynamic_threshold  (only active when total entries >= args.restrict)
+    //   val >= STATIC_THRESHOLD  (always applied)
+    //   val > dynamic_threshold  (-inf unless --restrict needs to drop entries)
     // -----------------------------------------------------------------------
 
-    let output_path = format!("{}.txt.gz", &args.out);
-    let output_file = File::create(&output_path)?;
-    let hap_writer = BufWriter::new(Box::new(output_file));
-
-    let sums_writer = if args.writesums {
-        Some(BufWriter::new(Box::new(File::create(format!(
-            "{}.sums",
-            &args.out
-        ))?)))
-    } else {
-        None
-    };
+    let (hap_writer, sums_writer) = open_outputs(args.writesums)?;
 
     eprintln!("Writing output matrix");
     parallel_read_write(args.threads, cl, hap_writer, sums_writer, dynamic_threshold)?;
     Ok(())
 }
 
-/// Returns threshold below which to exclude values from the output if there are more
-/// rows in the input than are permitted
-fn get_dynamic_threshold(cl: &HMat, nrows: usize) -> f64 {
+/// Returns the value at or below which entries are excluded from the output, so that at most
+/// `max_entries` entries are written. Returns -infinity if no entries need to be excluded.
+fn get_dynamic_threshold(cl: &HMat, max_entries: usize) -> f64 {
     eprintln!("Determining dynamic threshold");
+    // Only count entries that will survive the static threshold. This also excludes NaN.
     let mut all_values: Vec<f64> =
         cl.m.values()
             .flat_map(|row| row.v.values())
             .copied()
+            .filter(|&v| v >= STATIC_THRESHOLD)
             .collect();
 
     let total_length = all_values.len();
 
-    let dynamic_threshold: f64 = if all_values.len() >= nrows {
-        let n_to_drop = total_length - nrows;
-        // select_nth_unstable_by(k) rearranges all_values so that the element
-        // at sorted position k is in place. Elements before it are <= it and
-        // elements after are >= it. We then keep entries strictly > threshold,
-        // guaranteeing at most MAX_ENTRIES entries in the output.
-        // f64 doesn't implement Ord (due to NaN), so we use partial_cmp.
-        // The unwrap is safe: all values here are finite (>= 0.000005).
-        let threshold = all_values
-            .select_nth_unstable_by(n_to_drop - 1, |a, b| a.partial_cmp(b).unwrap())
+    let dynamic_threshold = if total_length > max_entries {
+        let n_to_drop = total_length - max_entries;
+        // After select_nth_unstable_by(k), the element at k is the one that would be at sorted
+        // position k. Keeping only entries > it drops at least the n_to_drop smallest entries.
+        let threshold = *all_values
+            .select_nth_unstable_by(n_to_drop - 1, |a, b| a.total_cmp(b))
             .1;
         eprintln!(
-            "Note: {} entries survive the static threshold (>= 2^31); \
-             applying dynamic threshold {:.6} to drop at least {} entries.",
-            total_length, threshold, n_to_drop
+            "Note: {} entries survive the static threshold, which is more than the {} allowed by \
+             --restrict; dropping entries <= {:.6} (at least {} entries).",
+            total_length, max_entries, threshold, n_to_drop
         );
-        *threshold
+        threshold
     } else {
-        // No dynamic exclusion needed; use -infinity so the condition
-        // `val > dynamic_threshold` is always satisfied for finite values.
+        eprintln!(
+            "{} entries survive the static threshold, no more than the {} allowed by --restrict; \
+             no dynamic threshold needed.",
+            total_length, max_entries
+        );
         f64::NEG_INFINITY
     };
 
@@ -348,8 +361,10 @@ fn filename_from_path(path: &str) -> &str {
 mod tests {
     use super::*;
     use itertools::Itertools;
+    use std::cell::Cell;
     use std::io::BufReader;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn verify_cli() {
@@ -373,8 +388,8 @@ mod tests {
             .into_owned()
     }
 
-    /// Read a file (optionally gzipped) and return the lines as a Vec<String>.
-    fn file_2_lines(bytes: &[u8], gz: bool) -> Vec<String> {
+    /// Read bytes (optionally gzipped) and return the lines.
+    fn bytes_2_lines(bytes: &[u8], gz: bool) -> Vec<String> {
         if gz {
             BufReader::new(GzDecoder::new(bytes))
                 .lines()
@@ -385,12 +400,70 @@ mod tests {
         }
     }
 
+    fn testdata_lines(filename: &str) -> Vec<String> {
+        bytes_2_lines(
+            &std::fs::read(testdata(filename)).unwrap(),
+            filename.ends_with(".gz"),
+        )
+    }
+
+    /// An in-memory writer that can be handed to `combine` (which needs `Send + 'static`) and read
+    /// back afterwards through a clone.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The lines of the matrix and, if it was written, the sums file.
+    struct Output {
+        entries: Vec<String>,
+        sums: Option<Vec<String>>,
+    }
+
+    /// Run combine on testdata with the given extra arguments, writing to memory.
+    fn run_in_memory(extra_args: &[&str]) -> Output {
+        let mut argv = vec![
+            "combine".to_string(),
+            "--chunkpathsfile".to_string(),
+            testdata("chunklength.files.txt"),
+            "--snpcountsfile".to_string(),
+            testdata("nsnps.txt"),
+            "--maplengthsfile".to_string(),
+            testdata("map_lengths.txt"),
+        ];
+        argv.extend(extra_args.iter().map(|a| a.to_string()));
+        let args = Args::parse_from(argv);
+
+        let hap = SharedBuf::default();
+        let sums = SharedBuf::default();
+        let sums_wanted = Cell::new(false);
+        combine(args, |writesums| {
+            sums_wanted.set(writesums);
+            Ok((hap.clone(), writesums.then(|| sums.clone())))
+        })
+        .unwrap();
+
+        Output {
+            entries: bytes_2_lines(&hap.0.lock().unwrap(), true),
+            sums: sums_wanted
+                .get()
+                .then(|| bytes_2_lines(&sums.0.lock().unwrap(), false)),
+        }
+    }
+
     /// Return the number of unique row indices in the output data.
-    fn get_nrows(data: Vec<String>) -> usize {
+    fn get_nrows(data: &[String]) -> usize {
         data.iter()
             .map(|s| {
                 s.split_ascii_whitespace()
-                    .into_iter()
                     .next()
                     .unwrap()
                     .parse::<usize>()
@@ -400,116 +473,145 @@ mod tests {
             .count()
     }
 
+    /// Number of individuals (rows) in testdata
+    const N_INDS: usize = 3202;
+
+    /// Number of entries in testdata/expected.rust.txt.gz
+    const N_EXPECTED_ENTRIES: usize = 1929576;
+
+    /// Parse "index sum" lines from a .sums file.
+    fn parse_sums(lines: &[String]) -> Vec<(usize, f64)> {
+        lines
+            .iter()
+            .map(|l| {
+                let (i, s) = l.split_once(' ').unwrap();
+                (i.parse().unwrap(), s.parse().unwrap())
+            })
+            .collect()
+    }
+
+    /// Check that a .sums file has one line for every row in testdata, in order, and that the sums
+    /// match those calculated from the C++ implementation's output (up to floating point error).
+    fn check_sums(lines: &[String]) {
+        let sums = parse_sums(lines);
+        let expected = testdata_lines("expected.cpp.sorted.sums");
+        assert_eq!(sums.len(), N_INDS);
+        assert_eq!(expected.len(), N_INDS);
+        for (k, ((i, s), e)) in sums.iter().zip(&expected).enumerate() {
+            assert_eq!(*i, k + 1);
+            let e: f64 = e.parse().unwrap();
+            assert!((s - e).abs() < 1e-3, "row {i}: sum {s}, expected {e}");
+        }
+    }
+
     #[test]
-    #[rustfmt::skip]
     fn test_combine_matches_expected() {
-        let args = Args::parse_from([
-            "combine",
-            "--chunkpathsfile", &testdata("chunklength.files.txt"),
-            "--snpcountsfile", &testdata("nsnps.txt"),
-            "--maplengthsfile", &testdata("map_lengths.txt"),
-            "--out", &testdata("combined"),
-        ]);
-
-        run(args).unwrap();
-
-        let actual = file_2_lines(&std::fs::read(testdata("combined.txt.gz")).unwrap(), true);
-        let expected = file_2_lines(&std::fs::read(testdata("expected.rust.txt.gz")).unwrap(), true);
-
-        assert_eq!(actual, expected);
-
-        std::fs::remove_file(testdata("combined.txt.gz")).unwrap();
+        let out = run_in_memory(&[]);
+        assert_eq!(out.entries, testdata_lines("expected.rust.txt.gz"));
+        assert!(out.sums.is_none());
     }
 
     #[test]
-    #[rustfmt::skip]
-    fn test_combine_matches_expected_r() {
-        let args = Args::parse_from([
-            "combine",
-            "--chunkpathsfile", &testdata("chunklength.files.txt"),
-            "--snpcountsfile", &testdata("nsnps.txt"),
-            "--maplengthsfile", &testdata("map_lengths.txt"),
-            "--writesums",
-            "--out", &testdata("combined.r"),
-        ]);
-
-        run(args).unwrap();
-
-        let actual = file_2_lines(&std::fs::read(testdata("combined.r.txt.gz")).unwrap(), true);
-        let expected = file_2_lines(&std::fs::read(testdata("expected.rust.txt.gz")).unwrap(), true);
-
-        assert_eq!(actual, expected);
-
-        let actual_sums = file_2_lines(&std::fs::read(testdata("combined.r.sums")).unwrap(), false);
-
-        assert_eq!(get_nrows(actual), actual_sums.len());
-
-        std::fs::remove_file(testdata("combined.r.txt.gz")).unwrap();
-        std::fs::remove_file(testdata("combined.r.sums")).unwrap();
+    fn test_combine_matches_expected_with_sums() {
+        let out = run_in_memory(&["--writesums"]);
+        assert_eq!(out.entries, testdata_lines("expected.rust.txt.gz"));
+        let sums = out.sums.unwrap();
+        assert_eq!(get_nrows(&out.entries), sums.len());
+        check_sums(&sums);
     }
 
     #[test]
-    #[rustfmt::skip]
-    fn test_combine_matches_expected_r_10000() {
-        let args = Args::parse_from([
-            "combine",
-            "--chunkpathsfile", &testdata("chunklength.files.txt"),
-            "--snpcountsfile", &testdata("nsnps.txt"),
-            "--maplengthsfile", &testdata("map_lengths.txt"),
-            "--restrict=10000",
-            "--out", &testdata("combined.r.10000"),
-        ]);
-
-        run(args).unwrap();
-
-        let actual = file_2_lines(&std::fs::read(testdata("combined.r.10000.txt.gz")).unwrap(), true);
-        assert!(actual.len() <= 10000);
-
-        let actual_sums = file_2_lines(&std::fs::read(testdata("combined.r.10000.sums")).unwrap(), false);
-
-        assert_eq!(get_nrows(actual), actual_sums.len());
-
-        std::fs::remove_file(testdata("combined.r.10000.txt.gz")).unwrap();
-        std::fs::remove_file(testdata("combined.r.10000.sums")).unwrap();
+    fn test_restrict_10000() {
+        let out = run_in_memory(&["--restrict=10000"]);
+        assert!(out.entries.len() <= 10000);
+        // rows with no entries left after --restrict are still in the sums file, with their full sums
+        assert!(get_nrows(&out.entries) < N_INDS);
+        check_sums(&out.sums.unwrap());
     }
 
     #[test]
-    #[rustfmt::skip]
+    fn test_restrict_equal_to_entry_count_keeps_everything() {
+        let out = run_in_memory(&[&format!("--restrict={N_EXPECTED_ENTRIES}")]);
+        assert_eq!(out.entries, testdata_lines("expected.rust.txt.gz"));
+    }
+
+    #[test]
+    fn test_restrict_one_below_entry_count_drops_smallest() {
+        let out = run_in_memory(&[&format!("--restrict={}", N_EXPECTED_ENTRIES - 1)]);
+        let expected = testdata_lines("expected.rust.txt.gz");
+        assert!(out.entries.len() < N_EXPECTED_ENTRIES);
+        check_sums(&out.sums.unwrap());
+
+        let value = |l: &String| l.split_whitespace().nth(2).unwrap().parse::<f64>().unwrap();
+        let min_kept = out.entries.iter().map(value).fold(f64::INFINITY, f64::min);
+        let kept: std::collections::HashSet<&String> = out.entries.iter().collect();
+        let max_expected_dropped = expected
+            .iter()
+            .filter(|l| !kept.contains(l))
+            .map(value)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(max_expected_dropped <= min_kept);
+    }
+
+    #[test]
+    fn test_restrict_zero_writes_no_entries_but_all_sums() {
+        let out = run_in_memory(&["--restrict=0"]);
+        assert!(out.entries.is_empty());
+        check_sums(&out.sums.unwrap());
+    }
+
+    #[test]
     fn test_combine_matches_expected_cpp() {
+        let out = run_in_memory(&["--writesums"]);
+        let expected = testdata_lines("expected.cpp.sorted.txt.gz");
+        assert_eq!(out.entries.len(), expected.len());
+
+        // there are small differences due to floating point precision between the rust
+        // implementation and the cpp implementation
+        let split = |l: &String| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let ij: (usize, usize) = (f[0].parse().unwrap(), f[1].parse().unwrap());
+            (ij, f[2].parse::<f64>().unwrap())
+        };
+        for (a, e) in out.entries.iter().zip(&expected) {
+            let (a_ij, a_val) = split(a);
+            let (e_ij, e_val) = split(e);
+            assert_eq!(a_ij, e_ij);
+            assert!((a_val - e_val).abs() < 1e-3, "{a} vs {e}");
+        }
+
+        check_sums(&out.sums.unwrap());
+    }
+
+    /// End-to-end check that `run` writes `<out>.txt.gz` and `<out>.sums`, in a temporary directory.
+    #[test]
+    fn test_run_writes_output_files() {
+        let dir = std::env::temp_dir().join(format!("combine-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("combined").to_string_lossy().into_owned();
         let args = Args::parse_from([
             "combine",
-            "--chunkpathsfile", &testdata("chunklength.files.txt"),
-            "--snpcountsfile", &testdata("nsnps.txt"),
-            "--maplengthsfile", &testdata("map_lengths.txt"),
-            "--writesums",
-            "--out", &testdata("combined.cpp"),
+            "--chunkpathsfile",
+            &testdata("chunklength.files.txt"),
+            "--snpcountsfile",
+            &testdata("nsnps.txt"),
+            "--maplengthsfile",
+            &testdata("map_lengths.txt"),
+            "--restrict=10000",
+            "--out",
+            &prefix,
         ]);
+        let result = run(args);
+        let entries = std::fs::read(format!("{prefix}.txt.gz"));
+        let sums = std::fs::read(format!("{prefix}.sums"));
+        std::fs::remove_dir_all(&dir).unwrap();
 
-        run(args).unwrap();
-
-        let actual = file_2_lines(&std::fs::read(testdata("combined.cpp.txt.gz")).unwrap(), true);
-        let expected = file_2_lines(&std::fs::read(testdata("expected.cpp.sorted.txt.gz")).unwrap(), true);
-
-        assert_eq!(actual.len(), expected.len());
-
-        // there are rounding differences due to floating point precision between the rust implementation and the cpp implementation
-        let actual_values_rounded = actual.iter().map(|l| l.split_whitespace().next().unwrap().parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-        let expected_values_rounded = expected.iter().map(|l| l.split_whitespace().next().unwrap().parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-
-        assert_eq!(actual_values_rounded, expected_values_rounded);
-
-        let actual_sums = file_2_lines(&std::fs::read(testdata("combined.cpp.sums")).unwrap(), false);
-        let expected_sums = file_2_lines(&std::fs::read(testdata("expected.cpp.sorted.sums")).unwrap(), false);
-
-        assert_eq!(actual_sums.len(), expected_sums.len());
-
-        // there are rounding differences due to floating point precision between the rust implementation and the cpp implementation
-        let actual_sums_rounded = actual_sums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-        let expected_sums_rounded = expected_sums.iter().map(|l| l.parse::<f64>().unwrap().round()).collect::<Vec<_>>();
-
-        assert_eq!(actual_sums_rounded, expected_sums_rounded);
-
-        std::fs::remove_file(testdata("combined.cpp.txt.gz")).unwrap();
-        std::fs::remove_file(testdata("combined.cpp.sums")).unwrap();
+        result.unwrap();
+        let in_memory = run_in_memory(&["--restrict=10000"]);
+        assert_eq!(bytes_2_lines(&entries.unwrap(), true), in_memory.entries);
+        assert_eq!(
+            bytes_2_lines(&sums.unwrap(), false),
+            in_memory.sums.unwrap()
+        );
     }
 }
