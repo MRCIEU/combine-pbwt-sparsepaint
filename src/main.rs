@@ -125,6 +125,10 @@ struct Args {
     #[arg(short, long, required = false, default_value_t = false)]
     writesums: bool,
 
+    /// Also write the matrix as a binary row stream to <OUT>.rows.bin (read by hcsvd): the same entries as <OUT>.txt.gz, for every row from the first sample to the last, with 0-based column indices (u32) and values (f32), little-endian. See the README for the layout
+    #[arg(short, long, required = false, default_value_t = false)]
+    binary: bool,
+
     /// The number of threads to use for writing.
     #[arg(short, long, required = false, default_value_t = 8)]
     threads: usize,
@@ -170,14 +174,19 @@ fn main() {
 
 fn run(args: Args) -> Result<()> {
     let out = args.out.clone();
-    combine(args, |writesums| {
+    combine(args, |writesums, binary| {
         let hap_writer = BufWriter::new(File::create(format!("{out}.txt.gz"))?);
         let sums_writer = if writesums {
             Some(BufWriter::new(File::create(format!("{out}.sums"))?))
         } else {
             None
         };
-        Ok((hap_writer, sums_writer))
+        let binary_writer = if binary {
+            Some(BufWriter::new(File::create(format!("{out}.rows.bin"))?))
+        } else {
+            None
+        };
+        Ok((hap_writer, sums_writer, binary_writer))
     })
 }
 
@@ -187,7 +196,7 @@ fn run(args: Args) -> Result<()> {
 fn combine<W, F>(mut args: Args, open_outputs: F) -> Result<()>
 where
     W: Write + Send + 'static,
-    F: FnOnce(bool) -> Result<(W, Option<W>)>,
+    F: FnOnce(bool, bool) -> Result<(W, Option<W>, Option<W>)>,
 {
     if args.threads < 1 {
         return Err(CombineError::Message(
@@ -253,7 +262,15 @@ where
     //   val > its row's dynamic threshold  (-inf unless --restrict needs to drop entries)
     // -----------------------------------------------------------------------
 
-    let (hap_writer, sums_writer) = open_outputs(args.writesums)?;
+    let (hap_writer, sums_writer, binary_writer) = open_outputs(args.writesums, args.binary)?;
+
+    // The binary row stream has a row for every sample index up to the largest one seen (as a row
+    // or a column), so that row r of the file is sample r + 1.
+    let n_rows =
+        cl.m.iter()
+            .map(|(i, row)| (*i).max(row.v.keys().next_back().copied().unwrap_or(0)))
+            .max()
+            .map_or(0, |m| m + 1);
 
     eprintln!("Writing output matrix");
     parallel_read_write(
@@ -261,6 +278,7 @@ where
         cl,
         hap_writer,
         sums_writer,
+        binary_writer.map(|w| (w, n_rows)),
         dynamic_thresholds,
     )?;
     Ok(())
@@ -508,6 +526,7 @@ mod tests {
     struct Output {
         entries: Vec<String>,
         sums: Option<Vec<String>>,
+        binary: Option<Vec<u8>>,
     }
 
     /// Run combine on testdata with the given extra arguments, writing to memory.
@@ -526,10 +545,17 @@ mod tests {
 
         let hap = SharedBuf::default();
         let sums = SharedBuf::default();
+        let bin = SharedBuf::default();
         let sums_wanted = Cell::new(false);
-        combine(args, |writesums| {
+        let binary_wanted = Cell::new(false);
+        combine(args, |writesums, binary| {
             sums_wanted.set(writesums);
-            Ok((hap.clone(), writesums.then(|| sums.clone())))
+            binary_wanted.set(binary);
+            Ok((
+                hap.clone(),
+                writesums.then(|| sums.clone()),
+                binary.then(|| bin.clone()),
+            ))
         })
         .unwrap();
 
@@ -538,6 +564,7 @@ mod tests {
             sums: sums_wanted
                 .get()
                 .then(|| bytes_2_lines(&sums.0.lock().unwrap(), false)),
+            binary: binary_wanted.get().then(|| bin.0.lock().unwrap().clone()),
         }
     }
 
@@ -785,6 +812,85 @@ mod tests {
         assert!(get_nrows(&row_fraction.entries) > get_nrows(&global.entries));
     }
 
+    /// Parse a binary row stream into (row, col, value) triples (1-based, as in the text output),
+    /// checking the header and that every row from 0 to n_rows - 1 is present.
+    fn parse_binary(b: &[u8]) -> (usize, Vec<(usize, usize, f32)>) {
+        assert_eq!(&b[..8], write::BINARY_MAGIC);
+        let n_rows = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+        let (mut pos, mut out) = (16, Vec::new());
+        let u32_at = |p: usize| u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+        for r in 0..n_rows {
+            let n = u32_at(pos) as usize;
+            pos += 4;
+            let cols: Vec<usize> = (0..n).map(|k| u32_at(pos + 4 * k) as usize).collect();
+            pos += 4 * n;
+            for (k, c) in cols.iter().enumerate() {
+                let v = f32::from_le_bytes(b[pos + 4 * k..pos + 4 * k + 4].try_into().unwrap());
+                out.push((r + 1, c + 1, v));
+            }
+            pos += 4 * n;
+            assert!(
+                cols.windows(2).all(|w| w[0] < w[1]),
+                "row {r}: columns not ascending"
+            );
+        }
+        assert_eq!(pos, b.len(), "trailing bytes after the last row");
+        (n_rows, out)
+    }
+
+    /// The binary row stream holds exactly the text output's entries, in the same order.
+    fn check_binary_matches_text(out: &Output) {
+        let (n_rows, bin) = parse_binary(out.binary.as_ref().unwrap());
+        assert_eq!(n_rows, N_INDS);
+        assert_eq!(bin.len(), out.entries.len());
+        for ((i, j, v), line) in bin.iter().zip(&out.entries) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!((*i, *j), (f[0].parse().unwrap(), f[1].parse().unwrap()));
+            let t: f64 = f[2].parse().unwrap();
+            // the text has 5 decimal places; the binary is the f32 of the unrounded value
+            assert!(
+                (*v as f64 - t).abs() <= 5e-6 + 1e-6 * t.abs(),
+                "{line} vs {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_binary_matches_text() {
+        let out = run_in_memory(&["--binary"]);
+        assert_eq!(out.entries, testdata_lines("expected.rust.txt.gz"));
+        check_binary_matches_text(&out);
+    }
+
+    #[test]
+    fn test_binary_matches_text_with_restrict() {
+        for mode in ["global", "row-fraction"] {
+            let out = run_in_memory(&[
+                "--binary",
+                "--restrict=10000",
+                &format!("--restrict-mode={mode}"),
+            ]);
+            check_binary_matches_text(&out);
+            // rows emptied by --restrict are still present (as empty rows) in the binary stream
+            let (n_rows, _) = parse_binary(out.binary.as_ref().unwrap());
+            assert_eq!(n_rows, N_INDS);
+        }
+    }
+
+    #[test]
+    fn test_binary_with_no_entries() {
+        let out = run_in_memory(&["--binary", "--restrict=0"]);
+        assert!(out.entries.is_empty());
+        let (n_rows, bin) = parse_binary(out.binary.as_ref().unwrap());
+        assert_eq!(n_rows, N_INDS);
+        assert!(bin.is_empty());
+    }
+
+    #[test]
+    fn test_no_binary_by_default() {
+        assert!(run_in_memory(&[]).binary.is_none());
+    }
+
     /// End-to-end check that `run` writes `<out>.txt.gz` and `<out>.sums`, in a temporary directory.
     #[test]
     fn test_run_writes_output_files() {
@@ -800,16 +906,19 @@ mod tests {
             "--maplengthsfile",
             &testdata("map_lengths.txt"),
             "--restrict=10000",
+            "--binary",
             "--out",
             &prefix,
         ]);
         let result = run(args);
         let entries = std::fs::read(format!("{prefix}.txt.gz"));
         let sums = std::fs::read(format!("{prefix}.sums"));
+        let binary = std::fs::read(format!("{prefix}.rows.bin"));
         std::fs::remove_dir_all(&dir).unwrap();
 
         result.unwrap();
-        let in_memory = run_in_memory(&["--restrict=10000"]);
+        let in_memory = run_in_memory(&["--restrict=10000", "--binary"]);
+        assert_eq!(binary.unwrap(), in_memory.binary.unwrap());
         assert_eq!(bytes_2_lines(&entries.unwrap(), true), in_memory.entries);
         assert_eq!(
             bytes_2_lines(&sums.unwrap(), false),
