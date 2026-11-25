@@ -2,7 +2,7 @@
 
 Combine the (usually) per-chromosome output of [pbwt](https://github.com/richarddurbin/pbwt) `-paintSparse` into a single file, re-scaling chunk lengths to be in map units rather than number of SNPs.
 
-For use when calculating [haplotype components](https://www.nature.com/articles/s41467-025-57601-3).
+For use when calculating [haplotype components](https://www.nature.com/articles/s41467-025-57601-3). It is the combining step of [pipeline-nf-haplotype-components](https://github.com/MRCIEU/pipeline-nf-haplotype-components), which runs the whole calculation from phased VCFs.
 
 The software in this repository is a re-implementation of [combine_chunklength](https://github.com/YaolingYang/SparsePainter/tree/main/painting-pipeline/Compute%20haplotype%20components%20(HCs)).
 
@@ -14,7 +14,7 @@ Documentation for the original haplotype component calculation pipeline [can be 
 2) per-chromosome sparse matrices of haplotype sharing lengths (in number of SNPs) -> total sparse matrix of haplotype sharing lengths (in map units)
 3) sparse matrix of haplotype sharing lengths (in map units) -> haplotype components (HCs) using singular value decomposition
 
-The program in this repository performs step 2.
+The program in this repository performs step 2. [hcsvd](https://github.com/MRCIEU/hc-svd) performs step 3.
 
 ## Installation
 
@@ -73,7 +73,7 @@ Optional:
 
 * `--writesums`: write the sum of the scaled values in each row (i.e. for each `index1`) of the sparse matrix to `<PREFIX>.sums`. Sums are calculated before any entries are dropped by `--restrict`. If you use `--restrict`, this file will be written by default. See [Output](#output).
 
-* `--binary`: also write the matrix as a binary row stream to `<PREFIX>.rows.bin`, for programs that load the whole matrix (e.g. to compute haplotype components) and would otherwise have to parse the gzipped text. It holds the same entries as `<PREFIX>.txt.gz`. See [Output](#output).
+* `--binary`: also write the matrix as a binary row stream to `<PREFIX>.rows.bin`, for programs that load the whole matrix (e.g. [hcsvd](https://github.com/MRCIEU/hc-svd), to compute haplotype components) and would otherwise have to parse the gzipped text. It holds the same entries as `<PREFIX>.txt.gz`. See [Output](#output).
 
 * `--threads`: number of threads to use for parallel processing of the output. Set to 8 by default. Must be `>=1`. The first part of the program (reading the data) is not parallelized, but the second part (writing the output) is parallelized, and speeds up with additional threads.
 
