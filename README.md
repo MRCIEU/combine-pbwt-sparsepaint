@@ -65,7 +65,11 @@ Required:
 
 Optional:
 
-* `--restrict`: restrict the number of entries (lines) in the output to at most `2^31-1` when provided with no argument, by dropping the entries with the smallest values. This is the largest number of non-zero entries a sparse matrix can hold in R's [Matrix](https://cran.r-project.org/package=Matrix) package (and the maximum number of rows in a `data.table`), so the output can be loaded with e.g. `data.table::fread()` and `Matrix::sparseMatrix()`. Specific values can be provided: `--restrict=N` writes at most `N` entries. If several entries tie at the cut-off value, they are all dropped, so slightly fewer than `N` entries may be written. The equals sign `=` is required when using this flag with a value.
+* `--restrict`: restrict the number of entries (lines) in the output to at most `2^31-1` when provided with no argument, by dropping the entries with the smallest values. This is the largest number of non-zero entries a sparse matrix can hold in R's [Matrix](https://cran.r-project.org/package=Matrix) package (and the maximum number of rows in a `data.table`), so the output can be loaded with e.g. `data.table::fread()` and `Matrix::sparseMatrix()`. Specific values can be provided: `--restrict=N` writes at most `N` entries. If several entries tie at the cut-off value, they are all dropped, so slightly fewer than `N` entries may be written. The equals sign `=` is required when using this flag with a value. Which entries are dropped is set by `--restrict-mode`.
+
+* `--restrict-mode`: how `--restrict` drops entries, if there are more than `N`. Needs `--restrict`.
+    * `global` (the default, and the only behaviour before v0.7.0): drop the entries with the smallest values in the whole matrix, using one cut-off for every row. Samples whose values are mostly small (e.g. those with fewer close matches in the data) can lose most or all of their entries.
+    * `row-fraction`: keep the same fraction (`N` / the number of entries) of every row's entries: for a row with `n` entries, its largest `floor(n × N / total)`. Every sample keeps a share of its entries, so rows are affected evenly. As with `global`, ties at a row's cut-off are all dropped, and rounding down means slightly fewer than `N` entries are written.
 
 * `--writesums`: write the sum of the scaled values in each row (i.e. for each `index1`) of the sparse matrix to `<PREFIX>.sums`. Sums are calculated before any entries are dropped by `--restrict`. If you use `--restrict`, this file will be written by default. See [Output](#output).
 
@@ -127,6 +131,17 @@ Each row sums to about `ploidy × total map length` (`ploidy` = 2 by default in 
 	-o chunklengths.restricted.100000
 ```
 
+```sh
+❯ combine \
+	-c chunklength.files.txt \
+	-s nsnps.txt \
+	-m chr1-22.maplengths.txt \
+	-r=100000 \
+	--restrict-mode=row-fraction \
+	-t 1 \
+	-o chunklengths.restricted.rowfraction.100000
+```
+
 ## Help
 
 ```
@@ -141,7 +156,9 @@ Options:
   -m, --maplengthsfile <MAPLENGTHSFILE>
           A file containing the map lengths for each chunk, in the same order as the chunk paths file [default: ""]
   -r, --restrict[=<RESTRICT>]
-          The maximum number of entries (lines) to write to the output file. The smallest values are dropped first [Default with flag but no value: 2^31-1, the most R's Matrix package can hold]
+          The maximum number of entries (lines) to write to the output file. Which entries are dropped is set by --restrict-mode [Default with flag but no value: 2^31-1, the most R's Matrix package can hold]
+      --restrict-mode <RESTRICT_MODE>
+          How --restrict drops entries when there are too many: "global" drops the smallest values in the whole matrix; "row-fraction" keeps the same fraction of each row's entries (its largest values), so that rows with small values are not dropped disproportionately [default: global] [possible values: global, row-fraction]
   -w, --writesums
           Write the sum of each row (index1) to <OUT>.sums, as "index1 sum", counting all values >= 0.000005 including any dropped by --restrict. Always written if --restrict is used
   -t, --threads <THREADS>
@@ -155,5 +172,5 @@ Options:
   -v, --version
           Print version
   -h, --help
-          Print help
+          Print help (see more with '--help')
 ```

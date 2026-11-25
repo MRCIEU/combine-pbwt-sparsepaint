@@ -17,8 +17,14 @@ pub(crate) fn parallel_read_write<BW: Write + Send + 'static>(
     cl: HMat,
     hap_writer: BW,
     mut rowsum_writer: Option<BW>,
-    dynamic_threshold: f64,
+    dynamic_thresholds: Vec<f64>,
 ) -> Result<()> {
+    assert_eq!(
+        dynamic_thresholds.len(),
+        cl.m.len(),
+        "one threshold per row"
+    );
+
     // Threads are split between gzip and formatting, with the gzip count rounded down.
     // This still works with nthreads = 1: (gzip_threads = 0, read_mat_threads = 1)
     let gzip_threads = nthreads / 2;
@@ -32,7 +38,11 @@ pub(crate) fn parallel_read_write<BW: Write + Send + 'static>(
         .num_threads(gzip_threads)
         .from_writer(hap_writer);
 
-    let rows: Vec<(&usize, &HVec)> = cl.m.iter().collect();
+    let rows: Vec<(&usize, &HVec, f64)> =
+        cl.m.iter()
+            .zip(dynamic_thresholds)
+            .map(|((key, row), threshold)| (key, row, threshold))
+            .collect();
 
     let mut pending = Vec::new();
     for chunk in rows.chunks(read_mat_threads * ROWS_PER_THREAD) {
@@ -42,7 +52,7 @@ pub(crate) fn parallel_read_write<BW: Write + Send + 'static>(
                 formatted = Some(
                     chunk
                         .par_iter()
-                        .map(|(key, row)| format_row(**key, row, dynamic_threshold))
+                        .map(|(key, row, threshold)| format_row(**key, row, *threshold))
                         .collect::<Result<Vec<_>>>(),
                 )
             });

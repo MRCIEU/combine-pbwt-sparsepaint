@@ -80,6 +80,16 @@ impl HVec {
     }
 }
 
+/// How `--restrict` chooses which entries to drop.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RestrictMode {
+    /// Drop the smallest values in the whole matrix (one cut-off for every row)
+    #[default]
+    Global,
+    /// Keep the same fraction of every row's entries (each row's largest values)
+    RowFraction,
+}
+
 // ---------------------------------------------------------------------------
 // CLI entry point
 // ---------------------------------------------------------------------------
@@ -103,9 +113,13 @@ struct Args {
     #[arg(short, long, required_unless_present_any = ["licences", "licences_summary"], default_value = "")]
     maplengthsfile: String,
 
-    /// The maximum number of entries (lines) to write to the output file. The smallest values are dropped first [Default with flag but no value: 2^31-1, the most R's Matrix package can hold]
+    /// The maximum number of entries (lines) to write to the output file. Which entries are dropped is set by --restrict-mode [Default with flag but no value: 2^31-1, the most R's Matrix package can hold]
     #[arg(short, long, default_missing_value = R_MAX_ENTRIES, num_args = 0..=1, require_equals = true)]
     restrict: Option<usize>,
+
+    /// How --restrict drops entries when there are too many: "global" drops the smallest values in the whole matrix; "row-fraction" keeps the same fraction of each row's entries (its largest values), so that rows with small values are not dropped disproportionately
+    #[arg(long, value_enum, default_value_t = RestrictMode::Global, requires = "restrict")]
+    restrict_mode: RestrictMode,
 
     /// Write the sum of each row (index1) to <OUT>.sums, as "index1 sum", counting all values >= 0.000005 including any dropped by --restrict. Always written if --restrict is used.
     #[arg(short, long, required = false, default_value_t = false)]
@@ -214,18 +228,21 @@ where
     eprintln!("Loading data complete");
 
     // -----------------------------------------------------------------------
-    // Determine dynamic threshold.
+    // Determine dynamic thresholds (one per row, in row order).
     //
     // If --restrict=N is set and more than N entries survive the static
-    // threshold, find a cut-off so that only entries strictly above it are
-    // written, leaving at most N entries. If there are ties at the cut-off,
-    // fewer than N entries may be written.
+    // threshold, find cut-offs so that only entries strictly above them are
+    // written, leaving at most N entries: one cut-off for the whole matrix
+    // (--restrict-mode=global), or one per row (--restrict-mode=row-fraction).
+    // If there are ties at a cut-off, fewer than N entries may be written.
     // -----------------------------------------------------------------------
-    let dynamic_threshold: f64 = if let Some(n) = nrows {
-        get_dynamic_threshold(&cl, n)
-    } else {
-        eprintln!("No dynamic threshold needed");
-        f64::NEG_INFINITY
+    let dynamic_thresholds: Vec<f64> = match (nrows, args.restrict_mode) {
+        (None, _) => {
+            eprintln!("No dynamic threshold needed");
+            vec![f64::NEG_INFINITY; cl.m.len()]
+        }
+        (Some(n), RestrictMode::Global) => vec![get_dynamic_threshold(&cl, n); cl.m.len()],
+        (Some(n), RestrictMode::RowFraction) => get_row_thresholds(&cl, n),
     };
 
     // -----------------------------------------------------------------------
@@ -233,13 +250,19 @@ where
     //
     // An entry is written iff:
     //   val >= STATIC_THRESHOLD  (always applied)
-    //   val > dynamic_threshold  (-inf unless --restrict needs to drop entries)
+    //   val > its row's dynamic threshold  (-inf unless --restrict needs to drop entries)
     // -----------------------------------------------------------------------
 
     let (hap_writer, sums_writer) = open_outputs(args.writesums)?;
 
     eprintln!("Writing output matrix");
-    parallel_read_write(args.threads, cl, hap_writer, sums_writer, dynamic_threshold)?;
+    parallel_read_write(
+        args.threads,
+        cl,
+        hap_writer,
+        sums_writer,
+        dynamic_thresholds,
+    )?;
     Ok(())
 }
 
@@ -281,6 +304,65 @@ fn get_dynamic_threshold(cl: &HMat, max_entries: usize) -> f64 {
 
     eprintln!("Determining dynamic threshold complete");
     dynamic_threshold
+}
+
+/// Returns a cut-off for each row (in row order) for --restrict-mode=row-fraction. If more than
+/// `max_entries` entries survive the static threshold, a row with n such entries keeps its largest
+/// floor(n * max_entries / total) entries (those strictly above its cut-off, so ties at the cut-off
+/// can make it fewer), so that at most `max_entries` are written in total. Otherwise every cut-off
+/// is -infinity.
+fn get_row_thresholds(cl: &HMat, max_entries: usize) -> Vec<f64> {
+    eprintln!("Determining per-row thresholds");
+    let passing = |row: &HVec| -> Vec<f64> {
+        row.v
+            .values()
+            .copied()
+            .filter(|&v| v >= STATIC_THRESHOLD)
+            .collect()
+    };
+    let total_length: usize =
+        cl.m.values()
+            .map(|row| row.v.values().filter(|&&v| v >= STATIC_THRESHOLD).count())
+            .sum();
+
+    if total_length <= max_entries {
+        eprintln!(
+            "{} entries survive the static threshold, no more than the {} allowed by --restrict; \
+             no dynamic thresholds needed.",
+            total_length, max_entries
+        );
+        return vec![f64::NEG_INFINITY; cl.m.len()];
+    }
+
+    let mut n_kept = 0;
+    let thresholds =
+        cl.m.values()
+            .map(|row| {
+                let mut values = passing(row);
+                let n = values.len();
+                let keep = (n as u128 * max_entries as u128 / total_length as u128) as usize;
+                n_kept += keep;
+                if keep >= n {
+                    f64::NEG_INFINITY
+                } else {
+                    // Keeping only entries > the (n - keep)th smallest drops at least n - keep entries.
+                    *values
+                        .select_nth_unstable_by(n - keep - 1, |a, b| a.total_cmp(b))
+                        .1
+                }
+            })
+            .collect();
+
+    eprintln!(
+        "Note: {} entries survive the static threshold, which is more than the {} allowed by \
+         --restrict; keeping the largest {:.4}% of each row's entries (at most {} entries).",
+        total_length,
+        max_entries,
+        100.0 * max_entries as f64 / total_length as f64,
+        n_kept
+    );
+    eprintln!("Determining per-row thresholds complete");
+    thresholds
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +663,126 @@ mod tests {
         }
 
         check_sums(&out.sums.unwrap());
+    }
+
+    #[test]
+    fn test_restrict_mode_requires_restrict() {
+        let base = ["combine", "-c", "a", "-s", "b", "-m", "c"];
+        let without = Args::try_parse_from(base.iter().chain(&["--restrict-mode=row-fraction"]));
+        assert!(without.is_err());
+        let with = Args::try_parse_from(
+            base.iter()
+                .chain(&["--restrict=10", "--restrict-mode=row-fraction"]),
+        )
+        .unwrap();
+        assert_eq!(with.restrict_mode, RestrictMode::RowFraction);
+        assert_eq!(
+            Args::try_parse_from(base).unwrap().restrict_mode,
+            RestrictMode::Global
+        );
+    }
+
+    #[test]
+    fn test_restrict_mode_global_is_the_default() {
+        let explicit = run_in_memory(&["--restrict=10000", "--restrict-mode=global"]);
+        let default = run_in_memory(&["--restrict=10000"]);
+        assert_eq!(explicit.entries, default.entries);
+        assert_eq!(explicit.sums, default.sums);
+    }
+
+    #[test]
+    fn test_row_fraction_keeps_everything_when_under_the_limit() {
+        let out = run_in_memory(&[
+            &format!("--restrict={N_EXPECTED_ENTRIES}"),
+            "--restrict-mode=row-fraction",
+        ]);
+        assert_eq!(out.entries, testdata_lines("expected.rust.txt.gz"));
+        check_sums(&out.sums.unwrap());
+    }
+
+    #[test]
+    fn test_row_fraction_zero_writes_no_entries_but_all_sums() {
+        let out = run_in_memory(&["--restrict=0", "--restrict-mode=row-fraction"]);
+        assert!(out.entries.is_empty());
+        check_sums(&out.sums.unwrap());
+    }
+
+    /// Group "i j value" lines by row: row -> values.
+    fn values_by_row(lines: &[String]) -> BTreeMap<usize, Vec<f64>> {
+        let mut rows: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+        for l in lines {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            rows.entry(f[0].parse().unwrap())
+                .or_default()
+                .push(f[2].parse().unwrap());
+        }
+        rows
+    }
+
+    /// With --restrict-mode=row-fraction, each row keeps at most floor(n * N / total) of its n
+    /// entries, the ones it keeps are its largest, and the total is at most N.
+    fn check_row_fraction(max_entries: usize) -> Output {
+        let out = run_in_memory(&[
+            &format!("--restrict={max_entries}"),
+            "--restrict-mode=row-fraction",
+        ]);
+        let expected = testdata_lines("expected.rust.txt.gz");
+        assert!(out.entries.len() <= max_entries);
+        let kept_set: std::collections::HashSet<&String> = out.entries.iter().collect();
+        assert!(out.entries.iter().all(|l| kept_set.contains(l)));
+
+        let all = values_by_row(&expected);
+        let kept = values_by_row(&out.entries);
+        let dropped = values_by_row(
+            &expected
+                .iter()
+                .filter(|l| !kept_set.contains(l))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let mut total_budget = 0;
+        for (i, values) in &all {
+            let budget = values.len() * max_entries / N_EXPECTED_ENTRIES;
+            total_budget += budget;
+            let k = kept.get(i).map_or(&[][..], |v| v.as_slice());
+            assert!(k.len() <= budget, "row {i}: kept {} > {budget}", k.len());
+            let min_kept = k.iter().copied().fold(f64::INFINITY, f64::min);
+            let max_dropped = dropped.get(i).map_or(f64::NEG_INFINITY, |v| {
+                v.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            });
+            assert!(
+                max_dropped <= min_kept,
+                "row {i}: dropped {max_dropped} > kept {min_kept}"
+            );
+        }
+        // rows keep fewer than their budget only when values tie at their cut-off: rare
+        let shortfall = total_budget - out.entries.len();
+        assert!(
+            shortfall * 1000 < total_budget,
+            "{shortfall} of {total_budget} entries lost to ties"
+        );
+        check_sums(out.sums.as_ref().unwrap());
+        out
+    }
+
+    #[test]
+    fn test_row_fraction_half() {
+        check_row_fraction(N_EXPECTED_ENTRIES / 2);
+    }
+
+    #[test]
+    fn test_row_fraction_10000_keeps_more_rows_than_global() {
+        let row_fraction = check_row_fraction(10000);
+        let global = run_in_memory(&["--restrict=10000"]);
+        // every row with at least N_EXPECTED_ENTRIES / 10000 entries keeps at least one
+        let all = values_by_row(&testdata_lines("expected.rust.txt.gz"));
+        let kept = values_by_row(&row_fraction.entries);
+        for (i, values) in &all {
+            if values.len() * 10000 >= N_EXPECTED_ENTRIES {
+                assert!(kept.contains_key(i), "row {i} lost all its entries");
+            }
+        }
+        assert!(get_nrows(&row_fraction.entries) > get_nrows(&global.entries));
     }
 
     /// End-to-end check that `run` writes `<out>.txt.gz` and `<out>.sums`, in a temporary directory.
