@@ -73,6 +73,8 @@ Optional:
 
 * `--writesums`: write the sum of the scaled values in each row (i.e. for each `index1`) of the sparse matrix to `<PREFIX>.sums`. Sums are calculated before any entries are dropped by `--restrict`. If you use `--restrict`, this file will be written by default. See [Output](#output).
 
+* `--binary`: also write the matrix as a binary row stream to `<PREFIX>.rows.bin`, for programs that load the whole matrix (e.g. to compute haplotype components) and would otherwise have to parse the gzipped text. It holds the same entries as `<PREFIX>.txt.gz`. See [Output](#output).
+
 * `--threads`: number of threads to use for parallel processing of the output. Set to 8 by default. Must be `>=1`. The first part of the program (reading the data) is not parallelized, but the second part (writing the output) is parallelized, and speeds up with additional threads.
 
 * `--out`: prefix for the output files. By default, this is set to `combined`, and the main output file will be called `<PREFIX>.txt.gz`. The sums file will be called `<PREFIX>.sums`, if written.
@@ -98,6 +100,19 @@ The row sums file is a space-separated plain text file with no header, called `<
 ```
 
 The sums include every value `>= 0.000005` (the same values that are written to `<PREFIX>.txt.gz` without `--restrict`). With `--restrict`, they also include the values that were dropped, and samples whose values were all dropped are still listed. So you can use them to re-weight rows after filtering.
+
+With `--binary`, `<PREFIX>.rows.bin` holds the same entries as `<PREFIX>.txt.gz`, as a stream of rows, all little-endian:
+
+| Field | Type | |
+|---|---|---|
+| magic | 8 bytes | `CMBROWS1` |
+| `n_rows` | u64 | number of rows: one per sample, from the first sample index to the largest index seen |
+| then, for each row `r` = 0 … `n_rows` − 1 (sample `index1` = `r` + 1): | | |
+| `n` | u32 | number of entries in the row (0 for a sample with none, e.g. after `--restrict`) |
+| columns | `n` × u32 | 0-based `index2` − 1, ascending |
+| values | `n` × f32 | the values (unrounded, as 32-bit floats; the text has 5 decimal places) |
+
+Rows can be read one at a time into a compressed sparse row matrix: there's no index to read first.
 
 Each row sums to about `ploidy × total map length` (`ploidy` = 2 by default in `pbwt -paintSparse`), because `pbwt` adds both of a sample's haplotypes into one row. A sample whose sum is lower than that is missing from some of the input files (it had no matches to other samples on those chromosomes).
 
@@ -161,6 +176,8 @@ Options:
           How --restrict drops entries when there are too many: "global" drops the smallest values in the whole matrix; "row-fraction" keeps the same fraction of each row's entries (its largest values), so that rows with small values are not dropped disproportionately [default: global] [possible values: global, row-fraction]
   -w, --writesums
           Write the sum of each row (index1) to <OUT>.sums, as "index1 sum", counting all values >= 0.000005 including any dropped by --restrict. Always written if --restrict is used
+  -b, --binary
+          Also write the matrix as a binary row stream to <OUT>.rows.bin (read by hcsvd): the same entries as <OUT>.txt.gz, for every row from the first sample to the last, with 0-based column indices (u32) and values (f32), little-endian. See the README for the layout
   -t, --threads <THREADS>
           The number of threads to use for writing [default: 8]
   -o, --out <OUT>
